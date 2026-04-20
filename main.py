@@ -63,7 +63,7 @@ CAPITAL          = 20.0
 RISK_USD         = 0.5       # Risque par trade
 LEVERAGE         = 20
 MAX_TRADES       = 5
-TOP_N            = 15        # Scanner top 15 cryptos volatiles
+TOP_N            = 15        # Scanner les 15 grands marchés crypto
 TIMEFRAME        = "1m"
 SL_ATR_MULT      = 1.5
 TP_RATIO         = 2.0
@@ -1006,25 +1006,52 @@ def get_klines(symbol, interval="1m", limit=KLINES_LIMIT):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ██ SCANNER VOLATILITÉ 24H
+#  ██ SCANNER — GRANDS MARCHÉS CRYPTO UNIQUEMENT
 # ═══════════════════════════════════════════════════════════════════
+
+# Liste fixe des grandes cryptos à scanner (par ordre de capitalisation)
+MAJOR_CRYPTOS = [
+    "BTCUSDT",   # Bitcoin
+    "ETHUSDT",   # Ethereum
+    "BNBUSDT",   # BNB
+    "SOLUSDT",   # Solana
+    "XRPUSDT",   # XRP
+    "ADAUSDT",   # Cardano
+    "AVAXUSDT",  # Avalanche
+    "DOGEUSDT",  # Dogecoin
+    "DOTUSDT",   # Polkadot
+    "MATICUSDT", # Polygon
+    "LINKUSDT",  # Chainlink
+    "LTCUSDT",   # Litecoin
+    "UNIUSDT",   # Uniswap
+    "ATOMUSDT",  # Cosmos
+    "NEARUSDT",  # NEAR Protocol
+]
+
 def get_top_volatile(n=TOP_N):
-    """Retourne les N cryptos les plus volatiles des 24 dernières heures."""
+    """Retourne les grandes cryptos avec leur volatilité 24h réelle."""
     tickers = bget("/fapi/v1/ticker/24hr")
     if not tickers:
-        return []
-    excluded = {"USDCUSDT", "BUSDUSDT", "TUSDUSDT", "USDTUSDT", "FDUSDUSDT", "BTCDOMUSDT"}
-    filtered = [
-        t for t in tickers
-        if t["symbol"].endswith("USDT")
-        and t["symbol"] not in excluded
-        and float(t.get("quoteVolume", 0)) >= MIN_VOLUME
-        and float(t.get("lastPrice", 0)) > 0.0001
-    ]
-    # Trier par volatilité absolue 24h
-    filtered.sort(key=lambda x: abs(float(x.get("priceChangePercent", 0))), reverse=True)
-    result = [(t["symbol"], abs(float(t.get("priceChangePercent", 0)))) for t in filtered[:n]]
-    return result
+        # Fallback : retourner la liste sans volatilité
+        log("⚠️  Impossible de récupérer les tickers — fallback liste fixe")
+        return [(sym, 0.0) for sym in MAJOR_CRYPTOS[:n]]
+
+    ticker_map = {t["symbol"]: t for t in tickers}
+    result = []
+    for sym in MAJOR_CRYPTOS:
+        t = ticker_map.get(sym)
+        if not t:
+            log(f"   ⚠️  {sym} non trouvé sur Binance Futures — ignoré")
+            continue
+        vol = abs(float(t.get("priceChangePercent", 0)))
+        volume = float(t.get("quoteVolume", 0))
+        if volume < MIN_VOLUME:
+            log(f"   ⚠️  {sym} volume trop faible ({volume:.0f}) — ignoré")
+            continue
+        result.append((sym, vol))
+
+    log(f"📋 Marchés scannés : {[s for s, _ in result]}")
+    return result[:n]
 
 
 # ═══════════════════════════════════════════════════════════════════
