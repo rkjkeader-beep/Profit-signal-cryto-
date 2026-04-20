@@ -947,7 +947,7 @@ def _tg_background_loop():
     log("📱 [TG] Thread Telegram démarré — en attente d'un message ou Chat ID...")
 
     # Tenter une 1re récupération immédiate (updates en attente)
-    for _ in range(5):
+    for _ in range(10):
         if tg_get_chat_id():
             break
         time.sleep(2)
@@ -956,6 +956,18 @@ def _tg_background_loop():
     if TG_CHAT_ID and not _welcome_sent:
         _send_startup_notification()
         _welcome_sent = True
+        # Si Binance pas encore connecté, envoyer une alerte séparée
+        if not BASE_URL:
+            time.sleep(2)
+            tg_send(
+                "⚠️ <b>Binance inaccessible depuis Render (US)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔄 Le bot tente de se connecter via proxy...\n"
+                "💡 <b>Solution recommandée :</b>\n"
+                "   → Ajouter un proxy payant dans <code>PROXY_URL</code>\n"
+                "   → Ou migrer vers un VPS européen\n"
+                "⏳ Nouvelle tentative toutes les 30s"
+            )
 
     # Boucle infinie : attendre un message et envoyer le welcome
     while True:
@@ -963,6 +975,12 @@ def _tg_background_loop():
             if tg_get_chat_id() and not _welcome_sent:
                 _send_startup_notification()
                 _welcome_sent = True
+                if not BASE_URL:
+                    time.sleep(2)
+                    tg_send(
+                        "⚠️ <b>Binance inaccessible depuis Render (US)</b>\n"
+                        "🔄 Tentative de connexion via proxy en cours..."
+                    )
         except Exception as e:
             log(f"[TG BG ERR] {e}")
         time.sleep(5)
@@ -970,7 +988,7 @@ def _tg_background_loop():
 
 def _send_startup_notification():
     """Envoie le message de démarrage Telegram."""
-    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "⏳ Connexion en cours..."
+    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "⚠️ Connexion Binance en cours (blocage Render/US — proxy actif)..."
     lines = [
         "🚀 <b>AlphaBot V7 — Démarré !</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1516,7 +1534,7 @@ def banner():
     print("╔══════════════════════════════════════════════════════════════════════╗")
     print("║   AlphaBot V7 — SMC + Claude AI + Trailing SL + Objectif $7/jour    ║")
     print(f"║  Capital: ${CAPITAL}  |  Risque: ${RISK_USD}/trade  |  Levier: {LEVERAGE}x             ║")
-    print(f"║  Scanner: Top {TOP_N} volatiles 24h  |  M1  |  Score min: {MIN_SCORE}         ║")
+    print(f"║  Scanner: Top {TOP_N} grands marchés crypto  |  M1  |  Score min: {MIN_SCORE}    ║")
     print(f"║  Objectif: ${DAILY_TARGET}/jour  |  Max perte: ${DAILY_MAX_LOSS}/jour              ║")
     print(f"║  Trailing SL: {TRAILING_ACTIVATION}x ATR activation, {TRAILING_DISTANCE_ATR}x ATR distance          ║")
     print(f"║  Claude AI : {ai_status:<44}║")
