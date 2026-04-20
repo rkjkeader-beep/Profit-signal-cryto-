@@ -181,13 +181,17 @@ def detect_binance_url():
     global BASE_URL
     log("🔍 Recherche URL Binance...")
     for url in BINANCE_URLS:
+        # Étape 1 : ping public
         try:
-            r = requests.get(url + "/fapi/v1/ping", timeout=8)
+            r = requests.get(url + "/fapi/v1/ping", timeout=10)
             if r.status_code != 200:
+                log(f"   ✗ {url} → ping {r.status_code}")
                 continue
+            log(f"   ✓ {url} → ping OK")
         except Exception as e:
-            log(f"   ✗ {url} → {str(e)[:50]}")
+            log(f"   ✗ {url} → {str(e)[:80]}")
             continue
+        # Étape 2 : tester les clés
         try:
             ts  = int(time.time() * 1000)
             q   = f"timestamp={ts}"
@@ -196,17 +200,23 @@ def detect_binance_url():
                 url + "/fapi/v2/balance",
                 params={"timestamp": ts, "signature": sig},
                 headers={"X-MBX-APIKEY": API_KEY},
-                timeout=8
+                timeout=10
             )
+            log(f"   ✓ {url} → auth status {ra.status_code}")
             if ra.status_code == 401:
-                log(f"   ✗ {url} → Clés rejetées (401)")
+                log(f"   ✗ {url} → Clés rejetées (401) — essai suivant")
                 continue
+            # 200 ou autre (400 = paramètre) = clés acceptées
             BASE_URL = url
-            log(f"✅ Binance connecté → {url}")
+            log(f"✅ Binance connecté → {url} (status auth: {ra.status_code})")
             return True
         except Exception as e:
-            log(f"   ✗ {url} → {str(e)[:50]}")
-    log("❌ Aucune URL Binance compatible.")
+            log(f"   ✗ {url} → auth erreur: {str(e)[:80]}")
+            # Si ping OK mais auth échoue réseau → on tente quand même
+            BASE_URL = url
+            log(f"⚠️ {url} → ping OK, auth timeout — on tente quand même")
+            return True
+    log("❌ Aucune URL Binance accessible depuis ce VPS.")
     return False
 
 
@@ -330,42 +340,306 @@ Réponds UNIQUEMENT en JSON valide, sans texte avant ou après:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ██ TELEGRAM — MESSAGES UNIQUEMENT POUR TRADES (pas de scan)
+#  ██ TELEGRAM — BOT INTERACTIF AVEC BOUTONS
 # ═══════════════════════════════════════════════════════════════════
 TG_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
 
+# Historique des trades pour rapports
+_trade_history = []   # liste de dicts {symbol, direction, pnl, reason, time}
+_subscribers   = set()  # tous les chat_id abonnés (pour partage groupe)
 
-def tg_send(text, chat_id=None):
-    cid = chat_id or TG_CHAT_ID
-    if not cid:
-        return
+
+def tg_send(text, chat_id=None, reply_markup=None):
+    """Envoie un message à un ou tous les abonnés."""
+    targets = [chat_id] if chat_id else (list(_subscribers) if _subscribers else ([TG_CHAT_ID] if TG_CHAT_ID else []))
+    for cid in targets:
+        if not cid:
+            continue
+        payload = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        try:
+            requests.post(f"{TG_BASE}/sendMessage", json=payload, timeout=8)
+        except Exception as e:
+            log(f"[TG ERR] {e}")
+
+
+def tg_answer_callback(callback_id):
     try:
-        requests.post(f"{TG_BASE}/sendMessage", json={
-            "chat_id":    cid,
-            "text":       text,
-            "parse_mode": "HTML"
-        }, timeout=8)
-    except Exception as e:
-        log(f"[TG ERR] {e}")
+        requests.post(f"{TG_BASE}/answerCallbackQuery",
+                      json={"callback_query_id": callback_id}, timeout=5)
+    except Exception:
+        pass
 
 
 def tg_get_chat_id():
     global TG_CHAT_ID, _update_offset
     try:
         r = requests.get(f"{TG_BASE}/getUpdates",
-                         params={"offset": _update_offset, "limit": 5}, timeout=8)
+                         params={"offset": _update_offset, "limit": 10}, timeout=8)
         updates = r.json().get("result", [])
         for u in updates:
             _update_offset = u["update_id"] + 1
+            # Gérer les callbacks (boutons cliqués)
+            if u.get("callback_query"):
+                handle_callback(u["callback_query"])
+                continue
             msg  = u.get("message") or u.get("channel_post") or {}
             chat = msg.get("chat", {})
-            if chat.get("id"):
-                TG_CHAT_ID = chat["id"]
+            cid  = chat.get("id")
+            if not cid:
+                continue
+            # Enregistrer tous les abonnés
+            _subscribers.add(cid)
+            if not TG_CHAT_ID:
+                TG_CHAT_ID = cid
                 log(f"✅ Telegram Chat ID: {TG_CHAT_ID}")
-                return True
+            # Gérer les commandes texte
+            text_msg = msg.get("text", "")
+            handle_command(text_msg, cid)
+        return bool(TG_CHAT_ID)
     except Exception as e:
         log(f"[TG getUpdates ERR] {e}")
     return False
+
+
+def handle_command(text, cid):
+    """Gérer les commandes /start /menu /pnl /trades /solde /rapport /help"""
+    t = text.strip().lower()
+    if t in ["/start", "/menu", "menu", "start"]:
+        send_main_menu(cid)
+    elif t in ["/pnl", "pnl"]:
+        send_pnl_report(cid)
+    elif t in ["/trades", "trades"]:
+        send_trade_history(cid)
+    elif t in ["/solde", "solde", "/balance"]:
+        send_balance(cid)
+    elif t in ["/rapport", "rapport"]:
+        send_daily_report(cid)
+    elif t in ["/positions", "positions"]:
+        send_positions(cid)
+    elif t in ["/help", "help"]:
+        send_help(cid)
+    elif t in ["/start"]:
+        send_main_menu(cid)
+
+
+def handle_callback(cb):
+    """Gérer les clics sur les boutons inline."""
+    cid  = cb["from"]["id"]
+    data = cb.get("data", "")
+    tg_answer_callback(cb["id"])
+    _subscribers.add(cid)
+
+    if data == "menu":
+        send_main_menu(cid)
+    elif data == "pnl":
+        send_pnl_report(cid)
+    elif data == "trades":
+        send_trade_history(cid)
+    elif data == "solde":
+        send_balance(cid)
+    elif data == "rapport":
+        send_daily_report(cid)
+    elif data == "positions":
+        send_positions(cid)
+    elif data == "parametres":
+        send_parametres(cid)
+
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def send_main_menu(cid):
+    pct  = (_daily_pnl / DAILY_TARGET * 100) if DAILY_TARGET > 0 else 0
+    bar  = "🟩" * int(pct / 10) + "⬜" * (10 - int(pct / 10))
+    lines = [
+        "🤖 <b>AlphaBot V7 — Tableau de bord</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 {date.today().strftime('%d/%m/%Y')}",
+        f"💰 PnL jour    : <b>${_daily_pnl:+.2f}</b> / ${DAILY_TARGET}",
+        f"📊 Progression : {bar} {pct:.0f}%",
+        f"🔢 Trades      : <b>{_daily_trades}</b>",
+        f"⚡ Statut      : <b>{'🟢 ACTIF' if BASE_URL else '🔴 HORS LIGNE'}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "Choisissez une option :"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [
+        [btn("💰 PnL & Profits", "pnl"),    btn("📋 Historique trades", "trades")],
+        [btn("💼 Solde compte", "solde"),    btn("📍 Positions ouvertes", "positions")],
+        [btn("📊 Rapport du jour", "rapport"), btn("⚙️ Paramètres", "parametres")],
+    ]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_pnl_report(cid):
+    wins   = [t for t in _trade_history if t["pnl"] > 0]
+    losses = [t for t in _trade_history if t["pnl"] <= 0]
+    total_win  = sum(t["pnl"] for t in wins)
+    total_loss = sum(t["pnl"] for t in losses)
+    winrate    = (len(wins) / len(_trade_history) * 100) if _trade_history else 0
+    lines = [
+        "💰 <b>Rapport PnL — AlphaBot V7</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📅 Aujourd'hui",
+        f"   PnL net     : <b>${_daily_pnl:+.2f}</b>",
+        f"   Objectif    : <b>${DAILY_TARGET}</b>",
+        f"   Progression : <b>{(_daily_pnl/DAILY_TARGET*100) if DAILY_TARGET else 0:.0f}%</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 Session",
+        f"   Trades total : <b>{len(_trade_history)}</b>",
+        f"   ✅ Gagnants  : <b>{len(wins)}</b>  (+${total_win:.2f})",
+        f"   ❌ Perdants  : <b>{len(losses)}</b>  (-${abs(total_loss):.2f})",
+        f"   🎯 Win rate  : <b>{winrate:.0f}%</b>",
+        f"   💵 Meilleur  : <b>${max((t['pnl'] for t in _trade_history), default=0):.2f}</b>",
+        f"   📉 Pire      : <b>${min((t['pnl'] for t in _trade_history), default=0):.2f}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"⚙️  Capital    : <b>${CAPITAL}</b>  |  Levier: <b>{LEVERAGE}x</b>",
+        f"<i>{datetime.now().strftime('%d/%m %H:%M')}</i>"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_trade_history(cid):
+    if not _trade_history:
+        msg = "📋 <b>Historique trades</b>\n\nAucun trade cette session."
+    else:
+        lines = ["📋 <b>Historique trades — Session</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+        for t in _trade_history[-10:]:
+            emoji = "✅" if t["pnl"] > 0 else "❌"
+            d     = "🟢" if t["direction"] == "LONG" else "🔴"
+            lines.append(f"{emoji} {d} <b>{t['symbol']}</b>  <code>${t['pnl']:+.2f}</code>")
+            lines.append(f"   <i>{t['reason']}</i>  •  {t['time']}")
+        msg = "\n".join(lines)
+    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_balance(cid):
+    data = bget("/fapi/v2/balance", {}, signed=True) if BASE_URL else None
+    if not data:
+        msg = "💼 <b>Solde compte</b>\n\n⚠️ Binance non connecté"
+    else:
+        usdt = next((a for a in data if a.get("asset") == "USDT"), None)
+        if usdt:
+            balance    = float(usdt.get("balance", 0))
+            available  = float(usdt.get("availableBalance", 0))
+            unrealized = float(usdt.get("crossUnPnl", 0))
+            lines = [
+                "💼 <b>Solde compte Binance</b>",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f"💵 Balance total  : <b>${balance:.2f}</b>",
+                f"✅ Disponible     : <b>${available:.2f}</b>",
+                f"📊 PnL non réalisé: <b>${unrealized:+.2f}</b>",
+                f"⚙️  Levier        : <b>{LEVERAGE}x</b>",
+                f"🎯 PnL jour       : <b>${_daily_pnl:+.2f}</b>",
+                f"<i>Binance Demo • {datetime.now().strftime('%H:%M:%S')}</i>"
+            ]
+            msg = "\n".join(lines)
+        else:
+            msg = "💼 Solde USDT non trouvé."
+    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_positions(cid):
+    positions = get_positions() if BASE_URL else []
+    if not positions:
+        msg = "📍 <b>Positions ouvertes</b>\n\nAucune position ouverte actuellement."
+    else:
+        lines = [f"📍 <b>Positions ouvertes ({len(positions)})</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+        for p in positions:
+            sym  = p["symbol"]
+            amt  = float(p.get("positionAmt", 0))
+            entry= float(p.get("entryPrice", 0))
+            pnl  = float(p.get("unRealizedProfit", 0))
+            side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
+            ep   = "✅" if pnl > 0 else "❌"
+            lines.append(f"{side} <b>{sym}</b>")
+            lines.append(f"   Entrée: <code>{entry:.4f}</code>  PnL: {ep} <b>${pnl:+.2f}</b>")
+        msg = "\n".join(lines)
+    markup = {"inline_keyboard": [[btn("🔄 Rafraîchir", "positions"), btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_daily_report(cid):
+    wins     = [t for t in _trade_history if t["pnl"] > 0]
+    losses   = [t for t in _trade_history if t["pnl"] <= 0]
+    winrate  = (len(wins) / len(_trade_history) * 100) if _trade_history else 0
+    status   = "🏆 OBJECTIF ATTEINT" if _daily_pnl >= DAILY_TARGET else ("🔴 PERTE" if _daily_pnl < 0 else "🟡 En cours")
+    lines = [
+        f"📊 <b>RAPPORT — {date.today().strftime('%d/%m/%Y')}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 PnL net     : <b>${_daily_pnl:+.2f}</b>",
+        f"🎯 Objectif    : <b>${DAILY_TARGET}</b>",
+        f"📈 Statut      : <b>{status}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📋 Trades",
+        f"   Total       : <b>{len(_trade_history)}</b>",
+        f"   ✅ TP        : <b>{len(wins)}</b>",
+        f"   ❌ SL        : <b>{len(losses)}</b>",
+        f"   🎯 Win rate  : <b>{winrate:.0f}%</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "⚙️  Config",
+        f"   Capital     : <b>${CAPITAL}</b>",
+        f"   Risque/trade: <b>${RISK_USD}</b>",
+        f"   Levier      : <b>{LEVERAGE}x</b>",
+        f"   Claude AI   : <b>{'✅ Activé' if USE_CLAUDE_AI else '❌ Off'}</b>",
+        f"   Trailing SL : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
+        f"<i>AlphaBot V7 • {datetime.now().strftime('%d/%m %H:%M')}</i>"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_parametres(cid):
+    lines = [
+        "⚙️ <b>Paramètres AlphaBot V7</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Capital      : <b>${CAPITAL}</b>",
+        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
+        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
+        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
+        f"🛑 Max perte/jour: <b>${DAILY_MAX_LOSS}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🔍 Scanner",
+        f"   Top N        : <b>{TOP_N}</b> cryptos",
+        f"   Volume min   : <b>${MIN_VOLUME:,}</b>",
+        f"   Score min SMC: <b>{MIN_SCORE}/12</b>",
+        "   Timeframe    : <b>M1</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🔄 Trailing SL",
+        f"   Activation   : <b>{TRAILING_ACTIVATION}x ATR</b>",
+        f"   Distance     : <b>{TRAILING_DISTANCE_ATR}x ATR</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
+        f"🌐 Binance       : <code>{BASE_URL or 'Non connecté'}</code>",
+        "<i>AlphaBot V7 Pro</i>"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
+    tg_send(msg, chat_id=cid, reply_markup=markup)
+
+
+def send_help(cid):
+    lines = [
+        "❓ <b>Commandes AlphaBot V7</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "/menu — 🏠 Tableau de bord",
+        "/pnl — 💰 Rapport PnL",
+        "/trades — 📋 Historique",
+        "/solde — 💼 Solde Binance",
+        "/positions — 📍 Positions",
+        "/rapport — 📊 Rapport jour",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "<i>Partagez ce bot avec votre groupe pour suivre en live !</i>"
+    ]
+    tg_send("\n".join(lines), chat_id=cid)
 
 
 def tg_signal(sig, ai):
@@ -456,19 +730,25 @@ def tg_daily_summary():
 
 
 def tg_welcome():
-    tg_send(
-        f"🚀 <b>AlphaBot V7 SMC + Claude AI — Démarré !</b>\n\n"
-        f"💰 Capital       : <b>${CAPITAL}</b>\n"
-        f"⚠️  Risque/trade : <b>${RISK_USD}</b>\n"
-        f"⚙️  Levier       : <b>{LEVERAGE}x</b>\n"
-        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>\n"
-        f"🔄 Trailing SL   : <b>{'Activé' if TRAILING_ENABLED else 'Désactivé'}</b>\n"
-        f"🔍 Scanner       : Top <b>{TOP_N}</b> cryptos volatiles 24h\n"
-        f"📊 Max trades    : <b>{MAX_TRADES}</b>\n"
-        f"🤖 Claude AI     : <b>{'Activé + Web Search' if USE_CLAUDE_AI else 'Désactivé'}</b>\n"
-        f"🌐 Binance       : <code>{BASE_URL}</code>\n\n"
-        f"<i>Telegram = trades uniquement (pas de scan)</i>"
-    )
+    lines = [
+        "🚀 <b>AlphaBot V7 — En ligne !</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Capital       : <b>${CAPITAL}</b>",
+        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
+        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
+        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
+        f"🔄 Trailing SL   : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
+        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
+        f"🌐 Binance       : <code>{BASE_URL}</code>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "<i>Tapez /menu pour le tableau de bord</i>"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [
+        [btn("🏠 Tableau de bord", "menu")],
+        [btn("💰 PnL", "pnl"), btn("💼 Solde", "solde")],
+    ]}
+    tg_send(msg, reply_markup=markup)
 
 
 def auto_detect_chat_id(timeout=90):
@@ -1035,6 +1315,9 @@ def main():
             positions    = get_positions()
             open_symbols = {p["symbol"] for p in positions}
             open_count   = len(positions)
+
+            # Écouter les commandes Telegram (boutons, /menu, etc.)
+            tg_get_chat_id()
 
             # Mettre à jour les trailing stops SILENCIEUSEMENT (pas de message Telegram)
             update_trailing_stops(open_symbols)
