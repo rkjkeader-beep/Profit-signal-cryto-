@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -16,6 +17,7 @@ import json
 import requests
 import os
 import threading
+import random
 from datetime import datetime, date
 from urllib.parse import urlencode
 from flask import Flask, jsonify
@@ -34,6 +36,14 @@ BINANCE_URLS = [
     "https://api.demo-trading.binance.com",
 ]
 BASE_URL = None
+
+# ── Proxy (optionnel — mettre USE_PROXY=True si Binance bloqué sur votre serveur)
+USE_PROXY    = False   # ← Mettre True si Binance inaccessible depuis votre VPS
+# Proxy payant recommandé (stable) : BrightData, Oxylabs, Smartproxy
+# Proxy gratuit : laisser vide → le bot cherche automatiquement via ProxyScrape
+PROXY_URL    = ""      # Ex: "http://user:pass@ip:port" ou "socks5://ip:port"
+_proxy_list  = []
+_proxy_index = 0
 
 # ── Anthropic Claude API
 ANTHROPIC_API_KEY = "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"
@@ -177,23 +187,79 @@ def price_str(price, tick):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  ██ PROXY — Accès Binance si VPS bloqué
+# ═══════════════════════════════════════════════════════════════════
+def fetch_free_proxies():
+    """Récupère une liste de proxies HTTPS gratuits depuis ProxyScrape."""
+    global _proxy_list
+    try:
+        r = requests.get(
+            "https://api.proxyscrape.com/v3/free-proxy-list/get"
+            "?request=displayproxies&protocol=http&timeout=5000"
+            "&proxy_format=ipport&format=text",
+            timeout=10
+        )
+        proxies = [f"http://{line.strip()}" for line in r.text.strip().splitlines() if line.strip()]
+        if proxies:
+            random.shuffle(proxies)
+            _proxy_list = proxies[:30]  # Garder 30 proxies max
+            log(f"🌐 {len(_proxy_list)} proxies gratuits récupérés")
+    except Exception as e:
+        log(f"[PROXY] Impossible de récupérer la liste: {e}")
+
+
+def get_next_proxy():
+    """Retourne le prochain proxy de la liste (rotation)."""
+    global _proxy_index
+    if PROXY_URL:
+        return {"http": PROXY_URL, "https": PROXY_URL}
+    if not _proxy_list:
+        fetch_free_proxies()
+    if not _proxy_list:
+        return None
+    proxy = _proxy_list[_proxy_index % len(_proxy_list)]
+    _proxy_index += 1
+    return {"http": proxy, "https": proxy}
+
+
+def apply_proxy_to_session(proxy_dict):
+    """Applique un proxy à la session requests globale."""
+    if proxy_dict:
+        sess.proxies.update(proxy_dict)
+        log(f"🔀 Proxy actif: {list(proxy_dict.values())[0]}")
+
+
+def test_binance_with_proxy(url, proxy_dict=None):
+    """Teste l'accès à une URL Binance avec ou sans proxy."""
+    try:
+        kwargs = {"timeout": 10}
+        if proxy_dict:
+            kwargs["proxies"] = proxy_dict
+        r = requests.get(url + "/fapi/v1/ping", **kwargs)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  ██ CONNEXION BINANCE
 # ═══════════════════════════════════════════════════════════════════
 def detect_binance_url():
     global BASE_URL
     log("🔍 Recherche URL Binance...")
+
+    # ── Étape 1 : essai direct (sans proxy)
     for url in BINANCE_URLS:
-        # Étape 1 : ping public
         try:
             r = requests.get(url + "/fapi/v1/ping", timeout=10)
             if r.status_code != 200:
                 log(f"   ✗ {url} → ping {r.status_code}")
                 continue
-            log(f"   ✓ {url} → ping OK")
+            log(f"   ✓ {url} → ping OK (direct)")
         except Exception as e:
             log(f"   ✗ {url} → {str(e)[:80]}")
             continue
-        # Étape 2 : tester les clés
+        # Auth
         try:
             ts  = int(time.time() * 1000)
             q   = f"timestamp={ts}"
@@ -208,20 +274,63 @@ def detect_binance_url():
             if ra.status_code == 401:
                 log(f"   ✗ {url} → Clés rejetées (401) — essai suivant")
                 continue
-            # 200 ou autre (400 = paramètre) = clés acceptées
             BASE_URL = url
-            log(f"✅ Binance connecté → {url} (status auth: {ra.status_code})")
+            log(f"✅ Binance connecté → {url}")
             return True
         except Exception as e:
             log(f"   ✗ {url} → auth erreur: {str(e)[:80]}")
-            # Si ping OK mais auth échoue réseau → on tente quand même
             BASE_URL = url
             log(f"⚠️ {url} → ping OK, auth timeout — on tente quand même")
             return True
-    log("❌ Aucune URL Binance accessible depuis ce VPS.")
-    log("   URLs testées :")
-    for u in BINANCE_URLS:
-        log(f"   • {u}")
+
+    # ── Étape 2 : fallback proxy (si USE_PROXY=True ou accès direct impossible)
+    log("⚠️ Accès direct Binance échoué — tentative via proxy...")
+    if not USE_PROXY and not PROXY_URL:
+        log("💡 Pour activer le proxy: mettre USE_PROXY = True dans la config")
+        log("❌ Aucune URL Binance accessible depuis ce VPS.")
+        return False
+
+    # Récupérer des proxies si liste vide
+    if not _proxy_list and not PROXY_URL:
+        fetch_free_proxies()
+
+    proxies_to_try = ([{"http": PROXY_URL, "https": PROXY_URL}] if PROXY_URL
+                      else _proxy_list[:10])
+
+    for proxy_raw in proxies_to_try:
+        proxy_dict = (proxy_raw if isinstance(proxy_raw, dict)
+                      else {"http": proxy_raw, "https": proxy_raw})
+        proxy_str  = list(proxy_dict.values())[0]
+        for url in BINANCE_URLS:
+            try:
+                r = requests.get(url + "/fapi/v1/ping",
+                                 proxies=proxy_dict, timeout=8)
+                if r.status_code != 200:
+                    continue
+                log(f"   ✓ {url} → ping OK via proxy {proxy_str}")
+                # Auth via proxy
+                ts  = int(time.time() * 1000)
+                q   = f"timestamp={ts}"
+                sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
+                ra  = requests.get(
+                    url + "/fapi/v2/balance",
+                    params={"timestamp": ts, "signature": sig},
+                    headers={"X-MBX-APIKEY": API_KEY},
+                    proxies=proxy_dict, timeout=10
+                )
+                if ra.status_code == 401:
+                    continue
+                # Proxy fonctionnel → l'appliquer à la session globale
+                apply_proxy_to_session(proxy_dict)
+                BASE_URL = url
+                log(f"✅ Binance connecté via proxy → {url}")
+                return True
+            except Exception:
+                continue
+
+    log("❌ Aucune URL Binance accessible (direct + proxy).")
+    log("   → Solution : mettre USE_PROXY=True et renseigner un proxy payant")
+    log("     dans PROXY_URL  ex: 'http://user:pass@ip:port'")
     return False
 
 
