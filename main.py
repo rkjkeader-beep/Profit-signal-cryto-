@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -44,6 +43,9 @@ USE_CLAUDE_AI     = True
 
 # ── Telegram
 TG_TOKEN   = "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI"
+# ⚠️  IMPORTANT : mettez votre Chat ID ici pour recevoir les messages immédiatement !
+# Pour trouver votre Chat ID : envoyez un message à @userinfobot sur Telegram
+# Exemple : TG_CHAT_ID = 123456789
 TG_CHAT_ID = None
 
 # ── Paramètres Trading
@@ -217,6 +219,9 @@ def detect_binance_url():
             log(f"⚠️ {url} → ping OK, auth timeout — on tente quand même")
             return True
     log("❌ Aucune URL Binance accessible depuis ce VPS.")
+    log("   URLs testées :")
+    for u in BINANCE_URLS:
+        log(f"   • {u}")
     return False
 
 
@@ -730,25 +735,10 @@ def tg_daily_summary():
 
 
 def tg_welcome():
-    lines = [
-        "🚀 <b>AlphaBot V7 — En ligne !</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 Capital       : <b>${CAPITAL}</b>",
-        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
-        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
-        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
-        f"🔄 Trailing SL   : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
-        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
-        f"🌐 Binance       : <code>{BASE_URL}</code>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "<i>Tapez /menu pour le tableau de bord</i>"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [
-        [btn("🏠 Tableau de bord", "menu")],
-        [btn("💰 PnL", "pnl"), btn("💼 Solde", "solde")],
-    ]}
-    tg_send(msg, reply_markup=markup)
+    """Alias vers _send_startup_notification pour compatibilité."""
+    global _welcome_sent
+    _send_startup_notification()
+    _welcome_sent = True
 
 
 def auto_detect_chat_id(timeout=90):
@@ -760,6 +750,66 @@ def auto_detect_chat_id(timeout=90):
             return True
         time.sleep(3)
     return False
+
+
+_welcome_sent = False
+
+def _tg_background_loop():
+    """
+    Thread de fond : détecte le Chat ID Telegram et envoie le message
+    de bienvenue dès qu'un utilisateur écrit au bot.
+    Tourne indéfiniment pour rester réactif aux commandes.
+    """
+    global TG_CHAT_ID, _welcome_sent
+
+    log("📱 [TG] Thread Telegram démarré — en attente d'un message ou Chat ID...")
+
+    # Tenter une 1re récupération immédiate (updates en attente)
+    for _ in range(5):
+        if tg_get_chat_id():
+            break
+        time.sleep(2)
+
+    # Envoyer immédiatement le message de démarrage si Chat ID déjà connu
+    if TG_CHAT_ID and not _welcome_sent:
+        _send_startup_notification()
+        _welcome_sent = True
+
+    # Boucle infinie : attendre un message et envoyer le welcome
+    while True:
+        try:
+            if tg_get_chat_id() and not _welcome_sent:
+                _send_startup_notification()
+                _welcome_sent = True
+        except Exception as e:
+            log(f"[TG BG ERR] {e}")
+        time.sleep(5)
+
+
+def _send_startup_notification():
+    """Envoie le message de démarrage Telegram."""
+    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "⏳ Connexion en cours..."
+    lines = [
+        "🚀 <b>AlphaBot V7 — Démarré !</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Capital       : <b>${CAPITAL}</b>",
+        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
+        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
+        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
+        f"🔄 Trailing SL   : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
+        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
+        f"🌐 Binance       : {binance_status}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🕒 Lancé le {datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}",
+        "<i>Tapez /menu pour le tableau de bord</i>"
+    ]
+    msg = "\n".join(lines)
+    markup = {"inline_keyboard": [
+        [btn("🏠 Tableau de bord", "menu")],
+        [btn("💰 PnL", "pnl"), btn("💼 Solde", "solde")],
+    ]}
+    tg_send(msg, reply_markup=markup)
+    log("✅ [TG] Message de démarrage envoyé !")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1269,15 +1319,25 @@ def main():
     banner()
     start_keepalive()  # Render keep-alive — DOIT rester vivant même si Binance KO
 
+    # ── Démarrer Telegram EN FOND immédiatement (n'attend PAS Binance)
+    tg_thread = threading.Thread(target=_tg_background_loop, daemon=True)
+    tg_thread.start()
+    log("📱 Thread Telegram démarré en arrière-plan")
+
     # Retry Binance jusqu'à connexion (ne jamais quitter = Render ne redémarre pas)
     while not detect_binance_url():
         log("⏳ Binance inaccessible — retry dans 30s...")
+        tg_send("⚠️ <b>AlphaBot V7</b> : Binance inaccessible, nouvelle tentative dans 30s...")
         time.sleep(30)
 
-    if not TG_CHAT_ID:
-        auto_detect_chat_id(90)
+    log(f"✅ Binance connecté : {BASE_URL}")
 
-    tg_welcome()
+    # Si le welcome n'a pas encore été envoyé (pas de Chat ID détecté avant),
+    # on l'envoie maintenant que Binance est connecté
+    global _welcome_sent
+    if TG_CHAT_ID and not _welcome_sent:
+        tg_welcome()
+        _welcome_sent = True
 
     scan_n  = 0
     sig_tot = 0
