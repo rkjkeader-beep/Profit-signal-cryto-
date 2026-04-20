@@ -37,11 +37,11 @@ BINANCE_URLS = [
 ]
 BASE_URL = None
 
-# ── Proxy (optionnel — mettre USE_PROXY=True si Binance bloqué sur votre serveur)
-USE_PROXY    = False   # ← Mettre True si Binance inaccessible depuis votre VPS
+# ── Proxy — activé automatiquement si Binance inaccessible
+USE_PROXY    = True    # Activé pour contourner le blocage Render/US
 # Proxy payant recommandé (stable) : BrightData, Oxylabs, Smartproxy
-# Proxy gratuit : laisser vide → le bot cherche automatiquement via ProxyScrape
-PROXY_URL    = ""      # Ex: "http://user:pass@ip:port" ou "socks5://ip:port"
+# Laisser vide → le bot récupère des proxies gratuits automatiquement
+PROXY_URL    = ""      # Ex: "http://user:pass@ip:port"
 _proxy_list  = []
 _proxy_index = 0
 
@@ -190,22 +190,95 @@ def price_str(price, tick):
 #  ██ PROXY — Accès Binance si VPS bloqué
 # ═══════════════════════════════════════════════════════════════════
 def fetch_free_proxies():
-    """Récupère une liste de proxies HTTPS gratuits depuis ProxyScrape."""
+    """
+    Récupère des proxies HTTPS gratuits depuis plusieurs sources.
+    Teste chaque proxy contre Binance avant de l'utiliser.
+    """
     global _proxy_list
-    try:
-        r = requests.get(
-            "https://api.proxyscrape.com/v3/free-proxy-list/get"
-            "?request=displayproxies&protocol=http&timeout=5000"
-            "&proxy_format=ipport&format=text",
-            timeout=10
-        )
-        proxies = [f"http://{line.strip()}" for line in r.text.strip().splitlines() if line.strip()]
-        if proxies:
-            random.shuffle(proxies)
-            _proxy_list = proxies[:30]  # Garder 30 proxies max
-            log(f"🌐 {len(_proxy_list)} proxies gratuits récupérés")
-    except Exception as e:
-        log(f"[PROXY] Impossible de récupérer la liste: {e}")
+    sources = [
+        # Source 1 : ProxyScrape — proxies HTTP rapides
+        "https://api.proxyscrape.com/v3/free-proxy-list/get"
+        "?request=displayproxies&protocol=http&timeout=3000"
+        "&proxy_format=ipport&format=text&anonymity=elite,anonymous",
+        # Source 2 : ProxyScrape HTTPS
+        "https://api.proxyscrape.com/v2/?request=getproxies"
+        "&protocol=https&timeout=3000&country=all&ssl=yes&anonymity=elite",
+        # Source 3 : GeoNode public
+        "https://proxylist.geonode.com/api/proxy-list"
+        "?limit=50&page=1&sort_by=lastChecked&sort_type=desc"
+        "&protocols=http%2Chttps&anonymityLevel=elite%2Canonymous",
+    ]
+
+    all_proxies = []
+
+    for url in sources:
+        try:
+            r = requests.get(url, timeout=10)
+            if "geonode" in url:
+                # Format JSON GeoNode
+                data = r.json().get("data", [])
+                for p in data:
+                    ip   = p.get("ip", "")
+                    port = p.get("port", "")
+                    if ip and port:
+                        all_proxies.append(f"http://{ip}:{port}")
+            else:
+                # Format texte ip:port
+                lines = [l.strip() for l in r.text.strip().splitlines() if l.strip()]
+                all_proxies.extend([f"http://{l}" for l in lines])
+        except Exception as e:
+            log(f"[PROXY] Source {url[:40]}... → {e}")
+
+    if not all_proxies:
+        log("[PROXY] ⚠️ Aucun proxy récupéré depuis les sources publiques")
+        return
+
+    random.shuffle(all_proxies)
+    all_proxies = list(dict.fromkeys(all_proxies))  # Dédoublonner
+
+    log(f"🌐 {len(all_proxies)} proxies récupérés — test en cours...")
+
+    # Tester les proxies en parallèle (garder les 10 premiers qui fonctionnent)
+    working = []
+
+    def test_proxy(proxy_url):
+        try:
+            pd = {"http": proxy_url, "https": proxy_url}
+            r  = requests.get(
+                "https://fapi.binance.com/fapi/v1/ping",
+                proxies=pd, timeout=6
+            )
+            if r.status_code == 200:
+                return proxy_url
+        except Exception:
+            pass
+        return None
+
+    threads = []
+    results = []
+    lock    = threading.Lock()
+
+    def worker(p):
+        result = test_proxy(p)
+        if result:
+            with lock:
+                results.append(result)
+
+    for proxy in all_proxies[:40]:  # Tester max 40 proxies
+        t = threading.Thread(target=worker, args=(proxy,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=8)
+
+    if results:
+        _proxy_list = results[:15]
+        log(f"✅ {len(_proxy_list)} proxies valides (testés contre Binance)")
+    else:
+        # Fallback : garder les proxies non testés
+        _proxy_list = all_proxies[:30]
+        log(f"⚠️ Aucun proxy validé — {len(_proxy_list)} gardés sans test")
 
 
 def get_next_proxy():
@@ -1434,9 +1507,16 @@ def main():
     log("📱 Thread Telegram démarré en arrière-plan")
 
     # Retry Binance jusqu'à connexion (ne jamais quitter = Render ne redémarre pas)
+    retry_count = 0
     while not detect_binance_url():
-        log("⏳ Binance inaccessible — retry dans 30s...")
+        retry_count += 1
+        log(f"⏳ Binance inaccessible — retry {retry_count} dans 30s...")
         tg_send("⚠️ <b>AlphaBot V7</b> : Binance inaccessible, nouvelle tentative dans 30s...")
+        # Tous les 3 échecs, rafraîchir la liste de proxies
+        if retry_count % 3 == 0:
+            log("🔄 Rafraîchissement de la liste de proxies...")
+            _proxy_list.clear()
+            fetch_free_proxies()
         time.sleep(30)
 
     log(f"✅ Binance connecté : {BASE_URL}")
