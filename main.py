@@ -315,57 +315,99 @@ def test_binance_with_proxy(url, proxy_dict=None):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ██ CONNEXION BINANCE
+#  ██ CONNEXION BINANCE — PUBLIC D'ABORD, AUTH OPTIONNEL
 # ═══════════════════════════════════════════════════════════════════
-def detect_binance_url():
-    global BASE_URL
-    log("🔍 Recherche URL Binance...")
 
-    # ── Étape 1 : essai direct (sans proxy)
-    for url in BINANCE_URLS:
-        try:
-            r = requests.get(url + "/fapi/v1/ping", timeout=10)
-            if r.status_code != 200:
-                log(f"   ✗ {url} → ping {r.status_code}")
-                continue
-            log(f"   ✓ {url} → ping OK (direct)")
-        except Exception as e:
-            log(f"   ✗ {url} → {str(e)[:80]}")
-            continue
-        # Auth
-        try:
-            ts  = int(time.time() * 1000)
-            q   = f"timestamp={ts}"
-            sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
-            ra  = requests.get(
-                url + "/fapi/v2/balance",
-                params={"timestamp": ts, "signature": sig},
-                headers={"X-MBX-APIKEY": API_KEY},
-                timeout=10
-            )
-            log(f"   ✓ {url} → auth status {ra.status_code}")
-            if ra.status_code == 401:
-                log(f"   ✗ {url} → Clés rejetées (401) — essai suivant")
-                continue
-            BASE_URL = url
-            log(f"✅ Binance connecté → {url}")
-            return True
-        except Exception as e:
-            log(f"   ✗ {url} → auth erreur: {str(e)[:80]}")
-            BASE_URL = url
-            log(f"⚠️ {url} → ping OK, auth timeout — on tente quand même")
-            return True
+# URLs publiques Binance Futures (sans clé API)
+PUBLIC_URLS = [
+    "https://fapi.binance.com",          # Production principale
+    "https://fapi1.binance.com",         # Backup 1
+    "https://fapi2.binance.com",         # Backup 2
+    "https://fapi3.binance.com",         # Backup 3
+    "https://testnet.binancefutures.com",# Testnet
+    "https://api.demo-trading.binance.com",
+]
 
-    # ── Étape 2 : fallback proxy (si USE_PROXY=True ou accès direct impossible)
-    log("⚠️ Accès direct Binance échoué — tentative via proxy...")
-    if not USE_PROXY and not PROXY_URL:
-        log("💡 Pour activer le proxy: mettre USE_PROXY = True dans la config")
-        log("❌ Aucune URL Binance accessible depuis ce VPS.")
+_auth_ok = False  # True si les clés API fonctionnent (pour passer des ordres)
+
+
+def test_public_ping(url, proxies=None):
+    """Teste uniquement le ping public (sans clé API)."""
+    try:
+        kwargs = {"timeout": 8}
+        if proxies:
+            kwargs["proxies"] = proxies
+        r = requests.get(url + "/fapi/v1/ping", **kwargs)
+        return r.status_code == 200
+    except Exception:
         return False
 
-    # Récupérer des proxies si liste vide
+
+def test_auth(url, proxies=None):
+    """Teste les clés API — optionnel, ne bloque pas le démarrage."""
+    global _auth_ok
+    try:
+        ts  = int(time.time() * 1000)
+        q   = f"timestamp={ts}"
+        sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
+        kwargs = {
+            "params":  {"timestamp": ts, "signature": sig},
+            "headers": {"X-MBX-APIKEY": API_KEY},
+            "timeout": 10
+        }
+        if proxies:
+            kwargs["proxies"] = proxies
+        ra = requests.get(url + "/fapi/v2/balance", **kwargs)
+        if ra.status_code == 200:
+            _auth_ok = True
+            log(f"   ✅ Auth OK — trading activé")
+            return True
+        elif ra.status_code == 401:
+            log(f"   ⚠️ Auth 401 — clés invalides, scan seul (pas d'ordres)")
+        else:
+            log(f"   ⚠️ Auth {ra.status_code} — scan OK, ordres peut-être limités")
+            _auth_ok = True  # On tente quand même
+        return False
+    except Exception as e:
+        log(f"   ⚠️ Auth timeout ({str(e)[:50]}) — scan public OK, ordres à tester")
+        _auth_ok = True  # Timeout ≠ clés invalides, on continue
+        return False
+
+
+def detect_binance_url():
+    """
+    Connexion en 2 phases :
+    1. Ping public (sans clé) → suffit pour scanner les marchés
+    2. Auth (avec clé) → nécessaire pour passer des ordres (optionnel au démarrage)
+    """
+    global BASE_URL, _auth_ok
+    log("🔍 Recherche URL Binance (API publique)...")
+
+    # ── Phase 1 : ping direct sans clé API
+    for url in PUBLIC_URLS:
+        try:
+            r = requests.get(url + "/fapi/v1/ping", timeout=8)
+            if r.status_code == 200:
+                log(f"   ✓ {url} → ping public OK")
+                BASE_URL = url
+                # Tester l'auth en parallèle (ne bloque pas)
+                threading.Thread(
+                    target=test_auth, args=(url,), daemon=True
+                ).start()
+                log(f"✅ Binance connecté (public) → {url}")
+                log(f"   → Scan des marchés actif | Auth en cours en arrière-plan...")
+                return True
+            else:
+                log(f"   ✗ {url} → {r.status_code}")
+        except Exception as e:
+            log(f"   ✗ {url} → {str(e)[:60]}")
+            continue
+
+    # ── Phase 2 : fallback via proxy
+    log("⚠️ Accès direct échoué — tentative via proxy...")
     if not _proxy_list and not PROXY_URL:
-        fetch_free_proxies()
+        if USE_PROXY:
+            fetch_free_proxies()
 
     proxies_to_try = ([{"http": PROXY_URL, "https": PROXY_URL}] if PROXY_URL
                       else _proxy_list[:10])
@@ -373,37 +415,17 @@ def detect_binance_url():
     for proxy_raw in proxies_to_try:
         proxy_dict = (proxy_raw if isinstance(proxy_raw, dict)
                       else {"http": proxy_raw, "https": proxy_raw})
-        proxy_str  = list(proxy_dict.values())[0]
-        for url in BINANCE_URLS:
-            try:
-                r = requests.get(url + "/fapi/v1/ping",
-                                 proxies=proxy_dict, timeout=8)
-                if r.status_code != 200:
-                    continue
-                log(f"   ✓ {url} → ping OK via proxy {proxy_str}")
-                # Auth via proxy
-                ts  = int(time.time() * 1000)
-                q   = f"timestamp={ts}"
-                sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
-                ra  = requests.get(
-                    url + "/fapi/v2/balance",
-                    params={"timestamp": ts, "signature": sig},
-                    headers={"X-MBX-APIKEY": API_KEY},
-                    proxies=proxy_dict, timeout=10
-                )
-                if ra.status_code == 401:
-                    continue
-                # Proxy fonctionnel → l'appliquer à la session globale
+        for url in PUBLIC_URLS:
+            if test_public_ping(url, proxies=proxy_dict):
                 apply_proxy_to_session(proxy_dict)
                 BASE_URL = url
-                log(f"✅ Binance connecté via proxy → {url}")
+                threading.Thread(
+                    target=test_auth, args=(url, proxy_dict), daemon=True
+                ).start()
+                log(f"✅ Binance connecté via proxy (public) → {url}")
                 return True
-            except Exception:
-                continue
 
-    log("❌ Aucune URL Binance accessible (direct + proxy).")
-    log("   → Solution : mettre USE_PROXY=True et renseigner un proxy payant")
-    log("     dans PROXY_URL  ex: 'http://user:pass@ip:port'")
+    log("❌ Aucun endpoint Binance accessible.")
     return False
 
 
@@ -988,7 +1010,8 @@ def _tg_background_loop():
 
 def _send_startup_notification():
     """Envoie le message de démarrage Telegram."""
-    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "⚠️ Connexion Binance en cours (blocage Render/US — proxy actif)..."
+    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "❌ Non connecté"
+    auth_status = "✅ Trading actif" if _auth_ok else "⏳ Vérification en cours..."
     lines = [
         "🚀 <b>AlphaBot V7 — Démarré !</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -999,6 +1022,7 @@ def _send_startup_notification():
         f"🔄 Trailing SL   : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
         f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
         f"🌐 Binance       : {binance_status}",
+        f"🔑 Auth/Ordres   : {auth_status}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"🕒 Lancé le {datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}",
         "<i>Tapez /menu pour le tableau de bord</i>"
