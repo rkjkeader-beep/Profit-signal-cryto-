@@ -1,13 +1,3 @@
-requests
-flask
-anthropic
-python-dotenv
-urllib3
-certifi
-charset-normalizer
-idna
-werkzeug
-click
-itsdangerous
-jinja2
-markupsafe
+
+requirements.txt  
+python main.py                    
