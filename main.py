@@ -1,1705 +1,431 @@
-
-#!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║   AlphaBot V7 — SMC + Claude AI + Trailing SL + Objectif $7/jour    ║
-║   Binance Futures Demo | Analyse Fondamentale Web | Telegram         ║
-║   Capital: $20 | Risque: $0.5/trade | Levier 20x | M1+M5            ║
-╚══════════════════════════════════════════════════════════════════════╝
-Dépendances : pip install requests
+main.py — AlphaBot SMC PRO (Leader ODG)
+Telegram bot + auto-scanner 30 secondes
++ Mission Stratégique Claude AI (Anthropic)
 """
 
-import time
-import hmac
-import hashlib
-import math
-import json
-import requests
+import asyncio
+import logging
 import os
-import threading
-import random
-from datetime import datetime, date
-from urllib.parse import urlencode
-from flask import Flask, jsonify
 
-# ═══════════════════════════════════════════════════════════════════
-#  ██ CONFIG — MODIFIEZ CES VALEURS
-# ═══════════════════════════════════════════════════════════════════
+# ─── TOKENS (fallback si variables d'environnement absentes) ──────────────────
+os.environ.setdefault("TELEGRAM_TOKEN",    "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
+os.environ.setdefault("ANTHROPIC_API_KEY", "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")
 
-# ── Binance Demo Futures (remplacez par vos clés)
-API_KEY    = "WxXiutDVQsnNWrYPu4Kyz7Pbwi8PC3edQBf9lSWJwL0Scz3EGNeWLsR6sdMRmPh0"
-SECRET_KEY = "BAzQ0Lav1DMCrBZf4MFl2msLO45fdWXOPH5aCr0ZmzuQF7miIP9fVAYHkzDDfb7F"
+# ─── Imports standard ─────────────────────────────────────────────────────────
+try:
+    import anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+    logging.warning("⚠️  Package 'anthropic' non installé — /ia désactivé. Lancez : pip install anthropic")
 
-BINANCE_URLS = [
-    "https://testnet.binancefutures.com",
-    "https://fapi.binance.com",
-    "https://api.demo-trading.binance.com",
-]
-BASE_URL = None
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ── Proxy — activé automatiquement si Binance inaccessible
-USE_PROXY    = True    # Activé pour contourner le blocage Render/US
-# Proxy payant recommandé (stable) : BrightData, Oxylabs, Smartproxy
-# Laisser vide → le bot récupère des proxies gratuits automatiquement
-PROXY_URL    = ""      # Ex: "http://user:pass@ip:port"
-_proxy_list  = []
-_proxy_index = 0
+import config
+import signal_manager as sm
+import session_manager as sess
+from market_data import get_candles, get_price
+from smc_engine import Direction, SMCEngine
 
-# ── Anthropic Claude API
-ANTHROPIC_API_KEY = "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"
-ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
-USE_CLAUDE_AI     = True
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# ── Telegram
-TG_TOKEN   = "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI"
-# ⚠️  IMPORTANT : mettez votre Chat ID ici pour recevoir les messages immédiatement !
-# Pour trouver votre Chat ID : envoyez un message à @userinfobot sur Telegram
-# Exemple : TG_CHAT_ID = 123456789
-TG_CHAT_ID = None
-
-# ── Paramètres Trading
-CAPITAL          = 20.0
-RISK_USD         = 0.5       # Risque par trade
-LEVERAGE         = 20
-MAX_TRADES       = 5
-TOP_N            = 15        # Scanner les 15 grands marchés crypto
-TIMEFRAME        = "1m"
-SL_ATR_MULT      = 1.5
-TP_RATIO         = 2.0
-SCAN_INTERVAL    = 60        # secondes entre scans
-MIN_SCORE        = 4
-MIN_VOLUME       = 10_000_000
-
-# ── Objectif journalier
-DAILY_TARGET     = 7.0       # $7 par jour
-DAILY_MAX_LOSS   = 5.0       # Stop trading si perte > $5/jour
-
-# ── Trailing Stop
-TRAILING_ENABLED      = True
-TRAILING_ACTIVATION   = 1.5  # Activer le trailing quand +1.5x ATR
-TRAILING_DISTANCE_ATR = 1.0  # Distance du trailing = 1x ATR
-
-# ── SMC
-SWING_LEN    = 5
-FVG_MIN_PCT  = 0.001
-ATR_PERIOD   = 14
-KLINES_LIMIT = 120
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ ÉTAT GLOBAL
-# ═══════════════════════════════════════════════════════════════════
-sess           = requests.Session()
-sess.headers.update({"X-MBX-APIKEY": API_KEY})
-
-_sym_cache      = {}
-_update_offset  = 0
-_claude_cache   = {}
-_trailing_data  = {}   # {symbol: {"highest": float, "atr": float, "direction": str}}
-
-# Compteurs journaliers
-_daily_pnl      = 0.0
-_daily_trades   = 0
-_daily_date     = date.today()
+engine = SMCEngine()
 
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE AI — ANALYSTE STRATÉGIQUE
+# ─────────────────────────────────────────────────────────────────────────────
 
+_CLAUDE_SYSTEM = """
+Tu es AlphaBot-AI, un analyste de trading de haut niveau spécialisé en Smart Money Concepts (SMC).
+Ta mission stratégique :
+1. Analyser la structure de marché (BOS, CHoCH, HH/LL) sur H4 pour la tendance macro.
+2. Identifier les zones clés M15 : Order Blocks, Breaker Blocks, FVG, Supply & Demand.
+3. Évaluer la session de trading en cours et son impact sur la liquidité.
+4. Proposer un bias directionnel clair (BULLISH / BEARISH / NEUTRE) avec raisonnement.
+5. Alerter si le contexte est défavorable (news, spread large, hors session).
+Réponds toujours en français, de façon concise, structurée et professionnelle.
+Ne donne jamais de conseil financier direct — tu fournis une analyse technique objective.
+"""
 
-def now_ms():
-    return int(time.time() * 1000)
+async def analyse_with_claude(symbol: str, trend_info: dict, zones_info: dict, session: str) -> str:
+    """Envoie le contexte marché à Claude et retourne son analyse stratégique."""
+    if not _ANTHROPIC_AVAILABLE:
+        return "❌ Module `anthropic` non installé sur ce serveur."
 
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return "❌ ANTHROPIC_API_KEY manquant."
 
-def sign(params):
-    params["timestamp"] = now_ms()
-    q   = urlencode(params)
-    sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
+    prompt = (
+        f"Symbole : {symbol}\n"
+        f"Session active : {session}\n\n"
+        f"=== TENDANCE H4 ===\n{trend_info}\n\n"
+        f"=== ZONES M15 ===\n{zones_info}\n\n"
+        "Fournis ton analyse stratégique complète selon ta mission."
+    )
 
-
-def bget(path, params=None, signed=False):
-    if not BASE_URL:
-        return None
-    if params is None:
-        params = {}
-    if signed:
-        params = sign(params)
     try:
-        r = sess.get(BASE_URL + path, params=params, timeout=12)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log(f"[BGET ERR] {path} → {e}")
-        return None
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        response = await client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=700,
+            system=_CLAUDE_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+
+    except anthropic.AuthenticationError:
+        return "❌ Clé API Anthropic invalide ou expirée."
+    except anthropic.RateLimitError:
+        return "⏳ Limite de requêtes Anthropic atteinte — réessaie dans quelques secondes."
+    except anthropic.APIConnectionError:
+        return "❌ Impossible de joindre l'API Anthropic (vérifier la connexion réseau)."
+    except Exception as exc:
+        logger.error(f"Claude API error: {exc}", exc_info=True)
+        return f"❌ Erreur inattendue Claude AI : {exc}"
 
 
-def bpost(path, params=None):
-    if not BASE_URL:
-        return None
-    if params is None:
-        params = {}
-    params = sign(params)
-    try:
-        r = sess.post(BASE_URL + path, params=params, timeout=12)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log(f"[BPOST ERR] {path} → {e}")
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *AlphaBot SMC PRO — Leader ODG*\n\n"
+        "Commandes :\n"
+        "`/price BTCUSD`  — Prix actuel + spread\n"
+        "`/trend BTCUSD`  — Tendance H4\n"
+        "`/zones BTCUSD`  — Zones M15 (OB, BB, FVG, S&D)\n"
+        "`/entry BTCUSD`  — Setup actif + signal complet\n"
+        "`/ia BTCUSD`     — 🧠 Analyse stratégique Claude AI\n"
+        "`/session`       — Session active\n"
+        "`/stats`         — Stats signaux du jour\n\n"
+        "Marchés : BTCUSD · XAUUSD · XAGUSD · EURUSD · NAS100",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
-def round_step(value, step):
-    if step == 0:
-        return round(value, 6)
-    s   = str(step)
-    dec = len(s.rstrip("0").split(".")[-1]) if "." in s else 0
-    return round(math.floor(value / step) * step, dec)
-
-
-def get_sym_info(symbol):
-    if symbol in _sym_cache:
-        return _sym_cache[symbol]
-    info = bget("/fapi/v1/exchangeInfo")
-    if not info:
-        return {"step": 0.001, "tick": 0.01, "min_qty": 0.001}
-    for s in info.get("symbols", []):
-        if s["symbol"] == symbol:
-            step, tick, min_qty = 0.001, 0.01, 0.001
-            for f in s.get("filters", []):
-                if f["filterType"] == "LOT_SIZE":
-                    step    = float(f["stepSize"])
-                    min_qty = float(f["minQty"])
-                if f["filterType"] == "PRICE_FILTER":
-                    tick = float(f["tickSize"])
-            r = {"step": step, "tick": tick, "min_qty": min_qty}
-            _sym_cache[symbol] = r
-            return r
-    return {"step": 0.001, "tick": 0.01, "min_qty": 0.001}
-
-
-def price_str(price, tick):
-    s   = str(tick)
-    dec = len(s.rstrip("0").split(".")[-1]) if "." in s else 0
-    return f"{round_step(price, tick):.{dec}f}"
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ PROXY — Accès Binance si VPS bloqué
-# ═══════════════════════════════════════════════════════════════════
-def fetch_free_proxies():
-    """
-    Récupère des proxies HTTPS gratuits depuis plusieurs sources.
-    Teste chaque proxy contre Binance avant de l'utiliser.
-    """
-    global _proxy_list
-    sources = [
-        # Source 1 : ProxyScrape — proxies HTTP rapides
-        "https://api.proxyscrape.com/v3/free-proxy-list/get"
-        "?request=displayproxies&protocol=http&timeout=3000"
-        "&proxy_format=ipport&format=text&anonymity=elite,anonymous",
-        # Source 2 : ProxyScrape HTTPS
-        "https://api.proxyscrape.com/v2/?request=getproxies"
-        "&protocol=https&timeout=3000&country=all&ssl=yes&anonymity=elite",
-        # Source 3 : GeoNode public
-        "https://proxylist.geonode.com/api/proxy-list"
-        "?limit=50&page=1&sort_by=lastChecked&sort_type=desc"
-        "&protocols=http%2Chttps&anonymityLevel=elite%2Canonymous",
-    ]
-
-    all_proxies = []
-
-    for url in sources:
-        try:
-            r = requests.get(url, timeout=10)
-            if "geonode" in url:
-                # Format JSON GeoNode
-                data = r.json().get("data", [])
-                for p in data:
-                    ip   = p.get("ip", "")
-                    port = p.get("port", "")
-                    if ip and port:
-                        all_proxies.append(f"http://{ip}:{port}")
-            else:
-                # Format texte ip:port
-                lines = [l.strip() for l in r.text.strip().splitlines() if l.strip()]
-                all_proxies.extend([f"http://{l}" for l in lines])
-        except Exception as e:
-            log(f"[PROXY] Source {url[:40]}... → {e}")
-
-    if not all_proxies:
-        log("[PROXY] ⚠️ Aucun proxy récupéré depuis les sources publiques")
+async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    symbol = (ctx.args[0].upper() if ctx.args else "BTCUSD")
+    if symbol not in config.MARKETS:
+        await update.message.reply_text(f"❌ Symbole inconnu : {symbol}")
         return
 
-    random.shuffle(all_proxies)
-    all_proxies = list(dict.fromkeys(all_proxies))  # Dédoublonner
-
-    log(f"🌐 {len(all_proxies)} proxies récupérés — test en cours...")
-
-    # Tester les proxies en parallèle (garder les 10 premiers qui fonctionnent)
-    working = []
-
-    def test_proxy(proxy_url):
-        try:
-            pd = {"http": proxy_url, "https": proxy_url}
-            r  = requests.get(
-                "https://fapi.binance.com/fapi/v1/ping",
-                proxies=pd, timeout=6
-            )
-            if r.status_code == 200:
-                return proxy_url
-        except Exception:
-            pass
-        return None
-
-    threads = []
-    results = []
-    lock    = threading.Lock()
-
-    def worker(p):
-        result = test_proxy(p)
-        if result:
-            with lock:
-                results.append(result)
-
-    for proxy in all_proxies[:40]:  # Tester max 40 proxies
-        t = threading.Thread(target=worker, args=(proxy,), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join(timeout=8)
-
-    if results:
-        _proxy_list = results[:15]
-        log(f"✅ {len(_proxy_list)} proxies valides (testés contre Binance)")
-    else:
-        # Fallback : garder les proxies non testés
-        _proxy_list = all_proxies[:30]
-        log(f"⚠️ Aucun proxy validé — {len(_proxy_list)} gardés sans test")
-
-
-def get_next_proxy():
-    """Retourne le prochain proxy de la liste (rotation)."""
-    global _proxy_index
-    if PROXY_URL:
-        return {"http": PROXY_URL, "https": PROXY_URL}
-    if not _proxy_list:
-        fetch_free_proxies()
-    if not _proxy_list:
-        return None
-    proxy = _proxy_list[_proxy_index % len(_proxy_list)]
-    _proxy_index += 1
-    return {"http": proxy, "https": proxy}
-
-
-def apply_proxy_to_session(proxy_dict):
-    """Applique un proxy à la session requests globale."""
-    if proxy_dict:
-        sess.proxies.update(proxy_dict)
-        log(f"🔀 Proxy actif: {list(proxy_dict.values())[0]}")
-
-
-def test_binance_with_proxy(url, proxy_dict=None):
-    """Teste l'accès à une URL Binance avec ou sans proxy."""
-    try:
-        kwargs = {"timeout": 10}
-        if proxy_dict:
-            kwargs["proxies"] = proxy_dict
-        r = requests.get(url + "/fapi/v1/ping", **kwargs)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ CONNEXION BINANCE — PUBLIC D'ABORD, AUTH OPTIONNEL
-# ═══════════════════════════════════════════════════════════════════
-
-# URLs publiques Binance Futures (sans clé API)
-PUBLIC_URLS = [
-    "https://fapi.binance.com",          # Production principale
-    "https://fapi1.binance.com",         # Backup 1
-    "https://fapi2.binance.com",         # Backup 2
-    "https://fapi3.binance.com",         # Backup 3
-    "https://testnet.binancefutures.com",# Testnet
-    "https://api.demo-trading.binance.com",
-]
-
-_auth_ok = False  # True si les clés API fonctionnent (pour passer des ordres)
-
-
-def test_public_ping(url, proxies=None):
-    """Teste uniquement le ping public (sans clé API)."""
-    try:
-        kwargs = {"timeout": 8}
-        if proxies:
-            kwargs["proxies"] = proxies
-        r = requests.get(url + "/fapi/v1/ping", **kwargs)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def test_auth(url, proxies=None):
-    """Teste les clés API — optionnel, ne bloque pas le démarrage."""
-    global _auth_ok
-    try:
-        ts  = int(time.time() * 1000)
-        q   = f"timestamp={ts}"
-        sig = hmac.new(SECRET_KEY.encode(), q.encode(), hashlib.sha256).hexdigest()
-        kwargs = {
-            "params":  {"timestamp": ts, "signature": sig},
-            "headers": {"X-MBX-APIKEY": API_KEY},
-            "timeout": 10
-        }
-        if proxies:
-            kwargs["proxies"] = proxies
-        ra = requests.get(url + "/fapi/v2/balance", **kwargs)
-        if ra.status_code == 200:
-            _auth_ok = True
-            log(f"   ✅ Auth OK — trading activé")
-            return True
-        elif ra.status_code == 401:
-            log(f"   ⚠️ Auth 401 — clés invalides, scan seul (pas d'ordres)")
-        else:
-            log(f"   ⚠️ Auth {ra.status_code} — scan OK, ordres peut-être limités")
-            _auth_ok = True  # On tente quand même
-        return False
-    except Exception as e:
-        log(f"   ⚠️ Auth timeout ({str(e)[:50]}) — scan public OK, ordres à tester")
-        _auth_ok = True  # Timeout ≠ clés invalides, on continue
-        return False
-
-
-def detect_binance_url():
-    """
-    Connexion en 2 phases :
-    1. Ping public (sans clé) → suffit pour scanner les marchés
-    2. Auth (avec clé) → nécessaire pour passer des ordres (optionnel au démarrage)
-    """
-    global BASE_URL, _auth_ok
-    log("🔍 Recherche URL Binance (API publique)...")
-
-    # ── Phase 1 : ping direct sans clé API
-    for url in PUBLIC_URLS:
-        try:
-            r = requests.get(url + "/fapi/v1/ping", timeout=8)
-            if r.status_code == 200:
-                log(f"   ✓ {url} → ping public OK")
-                BASE_URL = url
-                # Tester l'auth en parallèle (ne bloque pas)
-                threading.Thread(
-                    target=test_auth, args=(url,), daemon=True
-                ).start()
-                log(f"✅ Binance connecté (public) → {url}")
-                log(f"   → Scan des marchés actif | Auth en cours en arrière-plan...")
-                return True
-            else:
-                log(f"   ✗ {url} → {r.status_code}")
-        except Exception as e:
-            log(f"   ✗ {url} → {str(e)[:60]}")
-            continue
-
-    # ── Phase 2 : fallback via proxy
-    log("⚠️ Accès direct échoué — tentative via proxy...")
-    if not _proxy_list and not PROXY_URL:
-        if USE_PROXY:
-            fetch_free_proxies()
-
-    proxies_to_try = ([{"http": PROXY_URL, "https": PROXY_URL}] if PROXY_URL
-                      else _proxy_list[:10])
-
-    for proxy_raw in proxies_to_try:
-        proxy_dict = (proxy_raw if isinstance(proxy_raw, dict)
-                      else {"http": proxy_raw, "https": proxy_raw})
-        for url in PUBLIC_URLS:
-            if test_public_ping(url, proxies=proxy_dict):
-                apply_proxy_to_session(proxy_dict)
-                BASE_URL = url
-                threading.Thread(
-                    target=test_auth, args=(url, proxy_dict), daemon=True
-                ).start()
-                log(f"✅ Binance connecté via proxy (public) → {url}")
-                return True
-
-    log("❌ Aucun endpoint Binance accessible.")
-    return False
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ CLAUDE AI — ANALYSE FONDAMENTALE + WEB SEARCH
-# ═══════════════════════════════════════════════════════════════════
-def claude_analyze(symbol, direction, setups, score, volatility_24h):
-    """
-    Appelle Claude avec web_search pour analyser les fondamentaux réels.
-    Retourne: dict avec score_ai (0-3), verdict, raison, tendance, risque
-    """
-    if not USE_CLAUDE_AI or len(ANTHROPIC_API_KEY) < 20:
-        return {
-            "score_ai": 2, "verdict": "NEUTRE",
-            "reason": "Claude AI non configuré",
-            "trend_global": "NEUTRE", "risk_level": "MOYEN",
-            "news_summary": "Pas d'analyse web disponible"
-        }
-
-    cache_key = f"{symbol}_{direction}_{int(time.time()//300)}"
-    if cache_key in _claude_cache:
-        return _claude_cache[cache_key]
-
-    coin = symbol.replace("USDT", "")
-
-    prompt = f"""Tu es un expert trader crypto. Analyse ce signal de trading en temps réel.
-
-SIGNAL À ÉVALUER:
-- Paire       : {symbol} ({coin})
-- Direction   : {direction}
-- Setups SMC  : {", ".join(setups)}
-- Score SMC   : {score}/12
-- Volatilité 24h : {volatility_24h:.2f}%
-- Timeframe   : M1 (scalping Futures Levier 20x)
-
-MISSION EN 2 ÉTAPES:
-1. Recherche l'actualité récente sur {coin} (news, events, sentiment marché, on-chain data si dispo)
-2. Évalue si les fondamentaux soutiennent ce signal {direction}
-
-Critères score_ai:
-- 3 = Fondamentaux très favorables (news positive + trend {direction} confirmé)
-- 2 = Neutre (pas d'info contradictoire majeure)
-- 1 = Légèrement contre (quelques signaux négatifs)
-- 0 = BLOQUER ce trade (news très négative / manipulation / risk élevé)
-
-Réponds UNIQUEMENT en JSON valide, sans texte avant ou après:
-{{
-  "score_ai": <0-3>,
-  "verdict": "<FAVORABLE|NEUTRE|DÉFAVORABLE>",
-  "reason": "<15 mots max>",
-  "trend_global": "<BULL|BEAR|NEUTRE>",
-  "risk_level": "<FAIBLE|MOYEN|ÉLEVÉ>",
-  "news_summary": "<résumé news en 20 mots max>",
-  "close_recommendation": "<ATTENDRE_TP|SL_SUIVEUR|CLOTURER_MAINTENANT>"
-}}"""
-
-    try:
-        headers = {
-            "x-api-key":         ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type":      "application/json"
-        }
-        # Utiliser web_search pour actualités crypto en temps réel
-        body = {
-            "model":      CLAUDE_MODEL,
-            "max_tokens": 400,
-            "tools": [
-                {
-                    "type": "web_search_20250305",
-                    "name": "web_search"
-                }
-            ],
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        r = requests.post(ANTHROPIC_URL, headers=headers, json=body, timeout=25)
-        r.raise_for_status()
-        data = r.json()
-
-        # Assembler la réponse (peut contenir tool_use + text)
-        content_blocks = data.get("content", [])
-        text_parts = []
-        for block in content_blocks:
-            if block.get("type") == "text":
-                text_parts.append(block["text"])
-
-        content = " ".join(text_parts).strip()
-
-        # Nettoyer markdown si présent
-        if "```" in content:
-            parts = content.split("```")
-            for p in parts:
-                if p.startswith("json"):
-                    content = p[4:].strip()
-                    break
-                elif "{" in p:
-                    content = p.strip()
-                    break
-
-        # Extraire JSON
-        start = content.find("{")
-        end   = content.rfind("}") + 1
-        if start >= 0 and end > start:
-            content = content[start:end]
-
-        result = json.loads(content)
-        result["score_ai"] = max(0, min(3, int(result.get("score_ai", 1))))
-        if "close_recommendation" not in result:
-            result["close_recommendation"] = "ATTENDRE_TP"
-        _claude_cache[cache_key] = result
-        return result
-
-    except Exception as e:
-        log(f"  [Claude ERR] {e}")
-        return {
-            "score_ai": 1, "verdict": "NEUTRE",
-            "reason": "Erreur API Claude",
-            "trend_global": "NEUTRE", "risk_level": "MOYEN",
-            "news_summary": "Analyse non disponible",
-            "close_recommendation": "ATTENDRE_TP"
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ TELEGRAM — BOT INTERACTIF AVEC BOUTONS
-# ═══════════════════════════════════════════════════════════════════
-TG_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
-
-# Historique des trades pour rapports
-_trade_history = []   # liste de dicts {symbol, direction, pnl, reason, time}
-_subscribers   = set()  # tous les chat_id abonnés (pour partage groupe)
-
-
-def tg_send(text, chat_id=None, reply_markup=None):
-    """Envoie un message à un ou tous les abonnés."""
-    targets = [chat_id] if chat_id else (list(_subscribers) if _subscribers else ([TG_CHAT_ID] if TG_CHAT_ID else []))
-    for cid in targets:
-        if not cid:
-            continue
-        payload = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        try:
-            requests.post(f"{TG_BASE}/sendMessage", json=payload, timeout=8)
-        except Exception as e:
-            log(f"[TG ERR] {e}")
-
-
-def tg_answer_callback(callback_id):
-    try:
-        requests.post(f"{TG_BASE}/answerCallbackQuery",
-                      json={"callback_query_id": callback_id}, timeout=5)
-    except Exception:
-        pass
-
-
-def tg_get_chat_id():
-    global TG_CHAT_ID, _update_offset
-    try:
-        r = requests.get(f"{TG_BASE}/getUpdates",
-                         params={"offset": _update_offset, "limit": 10}, timeout=8)
-        updates = r.json().get("result", [])
-        for u in updates:
-            _update_offset = u["update_id"] + 1
-            # Gérer les callbacks (boutons cliqués)
-            if u.get("callback_query"):
-                handle_callback(u["callback_query"])
-                continue
-            msg  = u.get("message") or u.get("channel_post") or {}
-            chat = msg.get("chat", {})
-            cid  = chat.get("id")
-            if not cid:
-                continue
-            # Enregistrer tous les abonnés
-            _subscribers.add(cid)
-            if not TG_CHAT_ID:
-                TG_CHAT_ID = cid
-                log(f"✅ Telegram Chat ID: {TG_CHAT_ID}")
-            # Gérer les commandes texte
-            text_msg = msg.get("text", "")
-            handle_command(text_msg, cid)
-        return bool(TG_CHAT_ID)
-    except Exception as e:
-        log(f"[TG getUpdates ERR] {e}")
-    return False
-
-
-def handle_command(text, cid):
-    """Gérer les commandes /start /menu /pnl /trades /solde /rapport /help"""
-    t = text.strip().lower()
-    if t in ["/start", "/menu", "menu", "start"]:
-        send_main_menu(cid)
-    elif t in ["/pnl", "pnl"]:
-        send_pnl_report(cid)
-    elif t in ["/trades", "trades"]:
-        send_trade_history(cid)
-    elif t in ["/solde", "solde", "/balance"]:
-        send_balance(cid)
-    elif t in ["/rapport", "rapport"]:
-        send_daily_report(cid)
-    elif t in ["/positions", "positions"]:
-        send_positions(cid)
-    elif t in ["/help", "help"]:
-        send_help(cid)
-    elif t in ["/start"]:
-        send_main_menu(cid)
-
-
-def handle_callback(cb):
-    """Gérer les clics sur les boutons inline."""
-    cid  = cb["from"]["id"]
-    data = cb.get("data", "")
-    tg_answer_callback(cb["id"])
-    _subscribers.add(cid)
-
-    if data == "menu":
-        send_main_menu(cid)
-    elif data == "pnl":
-        send_pnl_report(cid)
-    elif data == "trades":
-        send_trade_history(cid)
-    elif data == "solde":
-        send_balance(cid)
-    elif data == "rapport":
-        send_daily_report(cid)
-    elif data == "positions":
-        send_positions(cid)
-    elif data == "parametres":
-        send_parametres(cid)
-
-
-def btn(text, data):
-    return {"text": text, "callback_data": data}
-
-
-def send_main_menu(cid):
-    pct  = (_daily_pnl / DAILY_TARGET * 100) if DAILY_TARGET > 0 else 0
-    bar  = "🟩" * int(pct / 10) + "⬜" * (10 - int(pct / 10))
-    lines = [
-        "🤖 <b>AlphaBot V7 — Tableau de bord</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📅 {date.today().strftime('%d/%m/%Y')}",
-        f"💰 PnL jour    : <b>${_daily_pnl:+.2f}</b> / ${DAILY_TARGET}",
-        f"📊 Progression : {bar} {pct:.0f}%",
-        f"🔢 Trades      : <b>{_daily_trades}</b>",
-        f"⚡ Statut      : <b>{'🟢 ACTIF' if BASE_URL else '🔴 HORS LIGNE'}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "Choisissez une option :"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [
-        [btn("💰 PnL & Profits", "pnl"),    btn("📋 Historique trades", "trades")],
-        [btn("💼 Solde compte", "solde"),    btn("📍 Positions ouvertes", "positions")],
-        [btn("📊 Rapport du jour", "rapport"), btn("⚙️ Paramètres", "parametres")],
-    ]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
-
-
-def send_pnl_report(cid):
-    wins   = [t for t in _trade_history if t["pnl"] > 0]
-    losses = [t for t in _trade_history if t["pnl"] <= 0]
-    total_win  = sum(t["pnl"] for t in wins)
-    total_loss = sum(t["pnl"] for t in losses)
-    winrate    = (len(wins) / len(_trade_history) * 100) if _trade_history else 0
-    lines = [
-        "💰 <b>Rapport PnL — AlphaBot V7</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📅 Aujourd'hui",
-        f"   PnL net     : <b>${_daily_pnl:+.2f}</b>",
-        f"   Objectif    : <b>${DAILY_TARGET}</b>",
-        f"   Progression : <b>{(_daily_pnl/DAILY_TARGET*100) if DAILY_TARGET else 0:.0f}%</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📊 Session",
-        f"   Trades total : <b>{len(_trade_history)}</b>",
-        f"   ✅ Gagnants  : <b>{len(wins)}</b>  (+${total_win:.2f})",
-        f"   ❌ Perdants  : <b>{len(losses)}</b>  (-${abs(total_loss):.2f})",
-        f"   🎯 Win rate  : <b>{winrate:.0f}%</b>",
-        f"   💵 Meilleur  : <b>${max((t['pnl'] for t in _trade_history), default=0):.2f}</b>",
-        f"   📉 Pire      : <b>${min((t['pnl'] for t in _trade_history), default=0):.2f}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"⚙️  Capital    : <b>${CAPITAL}</b>  |  Levier: <b>{LEVERAGE}x</b>",
-        f"<i>{datetime.now().strftime('%d/%m %H:%M')}</i>"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
-
-
-def send_trade_history(cid):
-    if not _trade_history:
-        msg = "📋 <b>Historique trades</b>\n\nAucun trade cette session."
-    else:
-        lines = ["📋 <b>Historique trades — Session</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-        for t in _trade_history[-10:]:
-            emoji = "✅" if t["pnl"] > 0 else "❌"
-            d     = "🟢" if t["direction"] == "LONG" else "🔴"
-            lines.append(f"{emoji} {d} <b>{t['symbol']}</b>  <code>${t['pnl']:+.2f}</code>")
-            lines.append(f"   <i>{t['reason']}</i>  •  {t['time']}")
-        msg = "\n".join(lines)
-    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
-
-
-def send_balance(cid):
-    data = bget("/fapi/v2/balance", {}, signed=True) if BASE_URL else None
+    data = get_price(symbol)
     if not data:
-        msg = "💼 <b>Solde compte</b>\n\n⚠️ Binance non connecté"
+        await update.message.reply_text(f"❌ Données indisponibles pour {symbol}")
+        return
+
+    digits = config.MARKETS[symbol]["digits"]
+    spread = data["spread"]
+
+    await update.message.reply_text(
+        f"💰 *{symbol}*\n"
+        f"Bid : `{data['bid']:.{digits}f}`\n"
+        f"Ask : `{data['ask']:.{digits}f}`\n"
+        f"Spread : `{spread:.{digits}f}`\n"
+        f"Type : {config.MARKETS[symbol]['type']}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    symbol = (ctx.args[0].upper() if ctx.args else "BTCUSD")
+    df = get_candles(symbol, config.TF_TREND, config.CANDLE_COUNT)
+
+    if df is None:
+        await update.message.reply_text(f"❌ Données H4 indisponibles pour {symbol}")
+        return
+
+    t = engine.trend(df)
+    s = engine.structure(df)
+    emoji = "📈" if t == Direction.BULLISH else "📉" if t == Direction.BEARISH else "➡️"
+
+    bos_txt   = f"BOS : {s['bos']}"     if s["bos"]   else "BOS : —"
+    choch_txt = f"CHoCH : {s['choch']}" if s["choch"] else "CHoCH : —"
+
+    await update.message.reply_text(
+        f"{emoji} *{symbol}* — H4 Trend : *{t.value}*\n"
+        f"{bos_txt}\n{choch_txt}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_zones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    symbol = (ctx.args[0].upper() if ctx.args else "BTCUSD")
+    df = get_candles(symbol, config.TF_ZONE, config.CANDLE_COUNT)
+
+    if df is None:
+        await update.message.reply_text(f"❌ Données M15 indisponibles pour {symbol}")
+        return
+
+    z   = engine.all_zones(df)
+    dig = config.MARKETS.get(symbol, {}).get("digits", 5)
+
+    def _fmt(zones, label):
+        if not zones:
+            return ""
+        lines = [f"\n{label}"]
+        for zn in zones[-3:]:
+            d = "Bull" if zn.direction == Direction.BULLISH else "Bear"
+            lines.append(f"  {d}: `{zn.low:.{dig}f}` — `{zn.high:.{dig}f}`")
+        return "\n".join(lines)
+
+    msg = f"📍 *Zones M15 — {symbol}*"
+    msg += _fmt(z["breaker_blocks"], "🔴 Breaker Blocks")
+    msg += _fmt(z["order_blocks"],   "🔵 Order Blocks")
+    msg += _fmt(z["fvg"],            "🟣 FVG")
+    msg += _fmt(z["supply_demand"],  "🟢 Supply / Demand")
+
+    if not any(z.values()):
+        msg += "\n\nAucune zone SMC détectée pour le moment."
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    symbol  = (ctx.args[0].upper() if ctx.args else "BTCUSD")
+    session = sess.current_session() or "Hors session"
+
+    await update.message.reply_text(f"🔍 Analyse {symbol} en cours…")
+
+    h4  = get_candles(symbol, config.TF_TREND, config.CANDLE_COUNT)
+    m15 = get_candles(symbol, config.TF_ZONE,  config.CANDLE_COUNT)
+    m1  = get_candles(symbol, config.TF_ENTRY, 100)
+
+    signal = engine.analyze(symbol, h4, m15, m1, session)
+
+    if signal is None:
+        await update.message.reply_text(
+            f"🔍 *{symbol}* — Pas de setup SMC valide (≥75 score, RR ≥ 1:3).\n"
+            f"Session : {session}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    msg = sm.format_signal(signal, count=sm.count_today())
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_ia(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🧠 Analyse stratégique Claude AI sur un symbole."""
+    symbol  = (ctx.args[0].upper() if ctx.args else "BTCUSD")
+    session = sess.current_session() or "Hors session"
+
+    if symbol not in config.MARKETS:
+        await update.message.reply_text(f"❌ Symbole inconnu : {symbol}")
+        return
+
+    await update.message.reply_text(f"🧠 Claude AI analyse *{symbol}*…", parse_mode=ParseMode.MARKDOWN)
+
+    # ── Récupération des données ───────────────────────────────────────────────
+    h4_df  = get_candles(symbol, config.TF_TREND, config.CANDLE_COUNT)
+    m15_df = get_candles(symbol, config.TF_ZONE,  config.CANDLE_COUNT)
+
+    # ── Construction du contexte tendance ─────────────────────────────────────
+    if h4_df is not None:
+        t  = engine.trend(h4_df)
+        s  = engine.structure(h4_df)
+        trend_info = (
+            f"Trend H4 : {t.value}\n"
+            f"BOS : {s.get('bos', '—')}\n"
+            f"CHoCH : {s.get('choch', '—')}"
+        )
     else:
-        usdt = next((a for a in data if a.get("asset") == "USDT"), None)
-        if usdt:
-            balance    = float(usdt.get("balance", 0))
-            available  = float(usdt.get("availableBalance", 0))
-            unrealized = float(usdt.get("crossUnPnl", 0))
-            lines = [
-                "💼 <b>Solde compte Binance</b>",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                f"💵 Balance total  : <b>${balance:.2f}</b>",
-                f"✅ Disponible     : <b>${available:.2f}</b>",
-                f"📊 PnL non réalisé: <b>${unrealized:+.2f}</b>",
-                f"⚙️  Levier        : <b>{LEVERAGE}x</b>",
-                f"🎯 PnL jour       : <b>${_daily_pnl:+.2f}</b>",
-                f"<i>Binance Demo • {datetime.now().strftime('%H:%M:%S')}</i>"
-            ]
-            msg = "\n".join(lines)
-        else:
-            msg = "💼 Solde USDT non trouvé."
-    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
+        trend_info = "Données H4 indisponibles"
 
-
-def send_positions(cid):
-    positions = get_positions() if BASE_URL else []
-    if not positions:
-        msg = "📍 <b>Positions ouvertes</b>\n\nAucune position ouverte actuellement."
+    # ── Construction du contexte zones ────────────────────────────────────────
+    if m15_df is not None:
+        z   = engine.all_zones(m15_df)
+        dig = config.MARKETS.get(symbol, {}).get("digits", 5)
+        zones_lines = []
+        for cat, label in [
+            ("order_blocks",   "Order Blocks"),
+            ("breaker_blocks", "Breaker Blocks"),
+            ("fvg",            "FVG"),
+            ("supply_demand",  "Supply/Demand"),
+        ]:
+            items = z.get(cat, [])
+            if items:
+                last = items[-1]
+                d = "Bull" if last.direction == Direction.BULLISH else "Bear"
+                zones_lines.append(
+                    f"{label} [{d}] : {last.low:.{dig}f} — {last.high:.{dig}f}"
+                )
+        zones_info = "\n".join(zones_lines) if zones_lines else "Aucune zone SMC détectée"
     else:
-        lines = [f"📍 <b>Positions ouvertes ({len(positions)})</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-        for p in positions:
-            sym  = p["symbol"]
-            amt  = float(p.get("positionAmt", 0))
-            entry= float(p.get("entryPrice", 0))
-            pnl  = float(p.get("unRealizedProfit", 0))
-            side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
-            ep   = "✅" if pnl > 0 else "❌"
-            lines.append(f"{side} <b>{sym}</b>")
-            lines.append(f"   Entrée: <code>{entry:.4f}</code>  PnL: {ep} <b>${pnl:+.2f}</b>")
-        msg = "\n".join(lines)
-    markup = {"inline_keyboard": [[btn("🔄 Rafraîchir", "positions"), btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
+        zones_info = "Données M15 indisponibles"
 
+    # ── Appel Claude AI ───────────────────────────────────────────────────────
+    analysis = await analyse_with_claude(symbol, trend_info, zones_info, session)
 
-def send_daily_report(cid):
-    wins     = [t for t in _trade_history if t["pnl"] > 0]
-    losses   = [t for t in _trade_history if t["pnl"] <= 0]
-    winrate  = (len(wins) / len(_trade_history) * 100) if _trade_history else 0
-    status   = "🏆 OBJECTIF ATTEINT" if _daily_pnl >= DAILY_TARGET else ("🔴 PERTE" if _daily_pnl < 0 else "🟡 En cours")
-    lines = [
-        f"📊 <b>RAPPORT — {date.today().strftime('%d/%m/%Y')}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 PnL net     : <b>${_daily_pnl:+.2f}</b>",
-        f"🎯 Objectif    : <b>${DAILY_TARGET}</b>",
-        f"📈 Statut      : <b>{status}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📋 Trades",
-        f"   Total       : <b>{len(_trade_history)}</b>",
-        f"   ✅ TP        : <b>{len(wins)}</b>",
-        f"   ❌ SL        : <b>{len(losses)}</b>",
-        f"   🎯 Win rate  : <b>{winrate:.0f}%</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚙️  Config",
-        f"   Capital     : <b>${CAPITAL}</b>",
-        f"   Risque/trade: <b>${RISK_USD}</b>",
-        f"   Levier      : <b>{LEVERAGE}x</b>",
-        f"   Claude AI   : <b>{'✅ Activé' if USE_CLAUDE_AI else '❌ Off'}</b>",
-        f"   Trailing SL : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
-        f"<i>AlphaBot V7 • {datetime.now().strftime('%d/%m %H:%M')}</i>"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
-
-
-def send_parametres(cid):
-    lines = [
-        "⚙️ <b>Paramètres AlphaBot V7</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 Capital      : <b>${CAPITAL}</b>",
-        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
-        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
-        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
-        f"🛑 Max perte/jour: <b>${DAILY_MAX_LOSS}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🔍 Scanner",
-        f"   Top N        : <b>{TOP_N}</b> cryptos",
-        f"   Volume min   : <b>${MIN_VOLUME:,}</b>",
-        f"   Score min SMC: <b>{MIN_SCORE}/12</b>",
-        "   Timeframe    : <b>M1</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🔄 Trailing SL",
-        f"   Activation   : <b>{TRAILING_ACTIVATION}x ATR</b>",
-        f"   Distance     : <b>{TRAILING_DISTANCE_ATR}x ATR</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
-        f"🌐 Binance       : <code>{BASE_URL or 'Non connecté'}</code>",
-        "<i>AlphaBot V7 Pro</i>"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [[btn("🔙 Menu", "menu")]]}
-    tg_send(msg, chat_id=cid, reply_markup=markup)
-
-
-def send_help(cid):
-    lines = [
-        "❓ <b>Commandes AlphaBot V7</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "/menu — 🏠 Tableau de bord",
-        "/pnl — 💰 Rapport PnL",
-        "/trades — 📋 Historique",
-        "/solde — 💼 Solde Binance",
-        "/positions — 📍 Positions",
-        "/rapport — 📊 Rapport jour",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "<i>Partagez ce bot avec votre groupe pour suivre en live !</i>"
-    ]
-    tg_send("\n".join(lines), chat_id=cid)
-
-
-def tg_signal(sig, ai):
-    """Message Telegram COMPLET — envoyé uniquement lors d'un trade réel."""
-    emoji  = "🟢" if sig["direction"] == "LONG" else "🔴"
-    arrow  = "📈" if sig["direction"] == "LONG" else "📉"
-    setups = " + ".join(sig["setups"])
-
-    verdict_emoji = {"FAVORABLE": "✅", "NEUTRE": "⚖️", "DÉFAVORABLE": "⛔"}.get(
-        ai.get("verdict", "NEUTRE"), "⚖️")
-    trend_emoji   = {"BULL": "🐂", "BEAR": "🐻", "NEUTRE": "➡️"}.get(
-        ai.get("trend_global", "NEUTRE"), "➡️")
-    risk_emoji    = {"FAIBLE": "🟢", "MOYEN": "🟡", "ÉLEVÉ": "🔴"}.get(
-        ai.get("risk_level", "MOYEN"), "🟡")
-    close_emoji   = {"ATTENDRE_TP": "⏳", "SL_SUIVEUR": "🔄", "CLOTURER_MAINTENANT": "⚡"}.get(
-        ai.get("close_recommendation", "ATTENDRE_TP"), "⏳")
-
-    total_score = sig["score"] + ai.get("score_ai", 0)
-    pnl_info    = f"${_daily_pnl:.2f}/{DAILY_TARGET:.0f}$"
-
-    msg = (
-        f"{emoji} <b>TRADE {sig['direction']} — AlphaBot V7</b> {arrow}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔷 Paire        : <b>{sig['symbol']}</b>\n"
-        f"🎯 Entrée       : <code>{sig['entry']:.4f}</code>\n"
-        f"🛑 Stop Loss    : <code>{sig['sl']:.4f}</code>\n"
-        f"💰 Take Profit  : <code>{sig['tp']:.4f}</code>\n"
-        f"🔄 Trailing SL  : <b>{'Activé' if TRAILING_ENABLED else 'Désactivé'}</b> ({TRAILING_ACTIVATION}x ATR)\n"
-        f"📊 Quantité     : <code>{sig['qty']}</code>\n"
-        f"⚙️  Levier      : <b>{LEVERAGE}x</b>\n"
-        f"💵 Risque       : <b>${RISK_USD}</b>  |  RR: <b>1:{int(TP_RATIO)}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 <b>Analyse Technique SMC</b>\n"
-        f"   Score       : <b>{sig['score']}/12</b>\n"
-        f"   Setups      : <i>{setups}</i>\n"
-        f"   ATR         : <code>{sig['atr']:.6f}</code>\n"
-        f"   Volatilité  : <b>{sig.get('volatility_24h', 0):.2f}%</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>Claude AI — Fondamentaux + News Web</b>\n"
-        f"   Verdict     : {verdict_emoji} <b>{ai.get('verdict','N/A')}</b>\n"
-        f"   Tendance    : {trend_emoji} {ai.get('trend_global','N/A')}\n"
-        f"   Risque      : {risk_emoji} {ai.get('risk_level','N/A')}\n"
-        f"   News        : <i>{ai.get('news_summary','N/A')}</i>\n"
-        f"   Raison      : <i>{ai.get('reason','')}</i>\n"
-        f"   Score AI    : <b>+{ai.get('score_ai',0)}/3</b>\n"
-        f"   Gestion     : {close_emoji} <b>{ai.get('close_recommendation','ATTENDRE_TP')}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Score Total  : <b>{total_score}/15</b>\n"
-        f"📅 PnL Jour     : <b>{pnl_info}</b>  |  Trades: <b>{_daily_trades}</b>\n"
-        f"⏱️  Timeframe   : M1  |  Demo Futures\n"
-        f"<i>AlphaBot V7 Pro • {datetime.now().strftime('%d/%m %H:%M:%S')}</i>"
+    header = f"🧠 *AlphaBot-AI — {symbol}* | Session : {session}\n{'─'*30}\n"
+    await update.message.reply_text(
+        header + analysis,
+        parse_mode=ParseMode.MARKDOWN,
     )
-    tg_send(msg)
 
 
-def tg_trade_closed(symbol, direction, pnl, reason, ai_rec):
-    """Notification de clôture de trade."""
-    emoji  = "✅" if pnl > 0 else "❌"
-    action = "🏆 PROFIT" if pnl > 0 else "💸 STOP"
-    pnl_info = f"${_daily_pnl:.2f}/{DAILY_TARGET:.0f}$"
-
-    msg = (
-        f"{emoji} <b>{action} — {symbol}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Direction  : <b>{direction}</b>\n"
-        f"💵 PnL Trade  : <b>${pnl:+.2f}</b>\n"
-        f"📋 Raison     : <i>{reason}</i>\n"
-        f"🤖 AI conseil : <i>{ai_rec}</i>\n"
-        f"📅 PnL Jour   : <b>{pnl_info}</b>\n"
-        f"<i>{datetime.now().strftime('%d/%m %H:%M:%S')}</i>"
-    )
-    tg_send(msg)
+async def cmd_session(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = sess.current_session()
+    news_block = sess.is_news_window()
+    if s:
+        msg = f"🕒 Session active : *{s}*"
+        if news_block:
+            msg += "\n⚠️ _Fenêtre news haute impact — trading suspendu_"
+    else:
+        msg = "💤 Hors session (Asia / marché fermé)"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
-def tg_daily_summary():
-    """Bilan quotidien."""
-    status = "🎯 OBJECTIF ATTEINT" if _daily_pnl >= DAILY_TARGET else "📊 En cours"
-    msg = (
-        f"📅 <b>BILAN JOURNALIER — AlphaBot V7</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 PnL Total   : <b>${_daily_pnl:+.2f}</b>\n"
-        f"🎯 Objectif    : <b>${DAILY_TARGET}</b>\n"
-        f"📊 Trades      : <b>{_daily_trades}</b>\n"
-        f"🏆 Statut      : <b>{status}</b>\n"
-        f"<i>{date.today().strftime('%d/%m/%Y')}</i>"
-    )
-    tg_send(msg)
+async def cmd_stats(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    count   = sm.count_today()
+    summary = sm.get_today_summary()
+    session = sess.current_session() or "Hors session"
+
+    lines = [f"📊 *Stats du jour*",
+             f"Signaux : {count}/{config.MAX_SIGNALS_PER_DAY}",
+             f"Session : {session}"]
+
+    if summary:
+        lines.append("\n*Derniers signaux :*")
+        for s in summary[-5:]:
+            emoji = "📈" if s["direction"] == "BUY" else "📉"
+            lines.append(f"  {emoji} {s['symbol']} {s['direction']} — RR 1:{s['rr']:.1f} | Score {s['score']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
-def tg_welcome():
-    """Alias vers _send_startup_notification pour compatibilité."""
-    global _welcome_sent
-    _send_startup_notification()
-    _welcome_sent = True
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-SCANNER (30 secondes)
+# ─────────────────────────────────────────────────────────────────────────────
 
+async def _scanner(app: Application):
+    logger.info("🔁 Auto-scanner démarré (30s)")
+    presignal_sent: set = set()
 
-def auto_detect_chat_id(timeout=90):
-    global TG_CHAT_ID
-    log("📱 Envoie un message à ton bot Telegram pour continuer...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if tg_get_chat_id():
-            return True
-        time.sleep(3)
-    return False
-
-
-_welcome_sent = False
-
-def _tg_background_loop():
-    """
-    Thread de fond : détecte le Chat ID Telegram et envoie le message
-    de bienvenue dès qu'un utilisateur écrit au bot.
-    Tourne indéfiniment pour rester réactif aux commandes.
-    """
-    global TG_CHAT_ID, _welcome_sent
-
-    log("📱 [TG] Thread Telegram démarré — en attente d'un message ou Chat ID...")
-
-    # Tenter une 1re récupération immédiate (updates en attente)
-    for _ in range(10):
-        if tg_get_chat_id():
-            break
-        time.sleep(2)
-
-    # Envoyer immédiatement le message de démarrage si Chat ID déjà connu
-    if TG_CHAT_ID and not _welcome_sent:
-        _send_startup_notification()
-        _welcome_sent = True
-        # Si Binance pas encore connecté, envoyer une alerte séparée
-        if not BASE_URL:
-            time.sleep(2)
-            tg_send(
-                "⚠️ <b>Binance inaccessible depuis Render (US)</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔄 Le bot tente de se connecter via proxy...\n"
-                "💡 <b>Solution recommandée :</b>\n"
-                "   → Ajouter un proxy payant dans <code>PROXY_URL</code>\n"
-                "   → Ou migrer vers un VPS européen\n"
-                "⏳ Nouvelle tentative toutes les 30s"
-            )
-
-    # Boucle infinie : attendre un message et envoyer le welcome
     while True:
         try:
-            if tg_get_chat_id() and not _welcome_sent:
-                _send_startup_notification()
-                _welcome_sent = True
-                if not BASE_URL:
-                    time.sleep(2)
-                    tg_send(
-                        "⚠️ <b>Binance inaccessible depuis Render (US)</b>\n"
-                        "🔄 Tentative de connexion via proxy en cours..."
-                    )
-        except Exception as e:
-            log(f"[TG BG ERR] {e}")
-        time.sleep(5)
-
-
-def _send_startup_notification():
-    """Envoie le message de démarrage Telegram."""
-    binance_status = f"<code>{BASE_URL}</code>" if BASE_URL else "❌ Non connecté"
-    auth_status = "✅ Trading actif" if _auth_ok else "⏳ Vérification en cours..."
-    lines = [
-        "🚀 <b>AlphaBot V7 — Démarré !</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 Capital       : <b>${CAPITAL}</b>",
-        f"⚠️  Risque/trade : <b>${RISK_USD}</b>",
-        f"⚙️  Levier       : <b>{LEVERAGE}x</b>",
-        f"🎯 Objectif/jour : <b>${DAILY_TARGET}</b>",
-        f"🔄 Trailing SL   : <b>{'✅ Activé' if TRAILING_ENABLED else '❌ Off'}</b>",
-        f"🤖 Claude AI     : <b>{'✅ Web Search' if USE_CLAUDE_AI else '❌ Off'}</b>",
-        f"🌐 Binance       : {binance_status}",
-        f"🔑 Auth/Ordres   : {auth_status}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 Lancé le {datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}",
-        "<i>Tapez /menu pour le tableau de bord</i>"
-    ]
-    msg = "\n".join(lines)
-    markup = {"inline_keyboard": [
-        [btn("🏠 Tableau de bord", "menu")],
-        [btn("💰 PnL", "pnl"), btn("💼 Solde", "solde")],
-    ]}
-    tg_send(msg, reply_markup=markup)
-    log("✅ [TG] Message de démarrage envoyé !")
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ DONNÉES OHLCV
-# ═══════════════════════════════════════════════════════════════════
-def get_klines(symbol, interval="1m", limit=KLINES_LIMIT):
-    data = bget("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    if not data or len(data) < 30:
-        return None
-    return [{"o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-             "c": float(k[4]), "v": float(k[5])} for k in data]
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ SCANNER — GRANDS MARCHÉS CRYPTO UNIQUEMENT
-# ═══════════════════════════════════════════════════════════════════
-
-# Liste fixe des grandes cryptos à scanner (par ordre de capitalisation)
-MAJOR_CRYPTOS = [
-    "BTCUSDT",   # Bitcoin
-    "ETHUSDT",   # Ethereum
-    "BNBUSDT",   # BNB
-    "SOLUSDT",   # Solana
-    "XRPUSDT",   # XRP
-    "ADAUSDT",   # Cardano
-    "AVAXUSDT",  # Avalanche
-    "DOGEUSDT",  # Dogecoin
-    "DOTUSDT",   # Polkadot
-    "MATICUSDT", # Polygon
-    "LINKUSDT",  # Chainlink
-    "LTCUSDT",   # Litecoin
-    "UNIUSDT",   # Uniswap
-    "ATOMUSDT",  # Cosmos
-    "NEARUSDT",  # NEAR Protocol
-]
-
-def get_top_volatile(n=TOP_N):
-    """Retourne les grandes cryptos avec leur volatilité 24h réelle."""
-    tickers = bget("/fapi/v1/ticker/24hr")
-    if not tickers:
-        # Fallback : retourner la liste sans volatilité
-        log("⚠️  Impossible de récupérer les tickers — fallback liste fixe")
-        return [(sym, 0.0) for sym in MAJOR_CRYPTOS[:n]]
-
-    ticker_map = {t["symbol"]: t for t in tickers}
-    result = []
-    for sym in MAJOR_CRYPTOS:
-        t = ticker_map.get(sym)
-        if not t:
-            log(f"   ⚠️  {sym} non trouvé sur Binance Futures — ignoré")
-            continue
-        vol = abs(float(t.get("priceChangePercent", 0)))
-        volume = float(t.get("quoteVolume", 0))
-        if volume < MIN_VOLUME:
-            log(f"   ⚠️  {sym} volume trop faible ({volume:.0f}) — ignoré")
-            continue
-        result.append((sym, vol))
-
-    log(f"📋 Marchés scannés : {[s for s, _ in result]}")
-    return result[:n]
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ MOTEUR SMC
-# ═══════════════════════════════════════════════════════════════════
-def compute_atr(candles, period=ATR_PERIOD):
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if len(trs) < period:
-        return sum(trs) / len(trs) if trs else 0.0001
-    return sum(trs[-period:]) / period
-
-
-def detect_swings(candles, n=SWING_LEN):
-    sh_idx, sl_idx = [], []
-    for i in range(n, len(candles) - n):
-        h, l = candles[i]["h"], candles[i]["l"]
-        if (all(h >= candles[i-j]["h"] for j in range(1, n+1)) and
-                all(h >= candles[i+j]["h"] for j in range(1, n+1))):
-            sh_idx.append(i)
-        if (all(l <= candles[i-j]["l"] for j in range(1, n+1)) and
-                all(l <= candles[i+j]["l"] for j in range(1, n+1))):
-            sl_idx.append(i)
-    return sh_idx, sl_idx
-
-
-def detect_bos_choch(candles):
-    sh_idx, sl_idx = detect_swings(candles)
-    if len(sh_idx) < 2 or len(sl_idx) < 2:
-        return None
-    last_c = candles[-1]["c"]
-    h_psn  = candles[sh_idx[-2]]["h"]
-    l_psl  = candles[sl_idx[-2]]["l"]
-    h_lsn  = candles[sh_idx[-1]]["h"]
-    l_lsl  = candles[sl_idx[-1]]["l"]
-    if l_lsl < l_psl and last_c > h_psn:
-        return {"type": "LONG",  "setup": "CHoCH_BULL", "ref": l_lsl, "score": 4}
-    if h_lsn > h_psn and last_c < l_psl:
-        return {"type": "SHORT", "setup": "CHoCH_BEAR", "ref": h_lsn, "score": 4}
-    if last_c > h_lsn and h_lsn > h_psn:
-        return {"type": "LONG",  "setup": "BOS_BULL",   "ref": l_lsl, "score": 3}
-    if last_c < l_lsl and l_lsl < l_psl:
-        return {"type": "SHORT", "setup": "BOS_BEAR",   "ref": h_lsn, "score": 3}
-    return None
-
-
-def detect_liq_sweep(candles):
-    sh_idx, sl_idx = detect_swings(candles)
-    if not sh_idx or not sl_idx:
-        return None
-    sh_lvls = [candles[i]["h"] for i in sh_idx]
-    sl_lvls = [candles[i]["l"] for i in sl_idx]
-    p_low, p_high, l_close = candles[-2]["l"], candles[-2]["h"], candles[-1]["c"]
-    n_sl = min(sl_lvls, key=lambda x: abs(x - p_low))
-    n_sh = min(sh_lvls, key=lambda x: abs(x - p_high))
-    if p_low < n_sl * 0.9995 and l_close > n_sl:
-        return {"type": "BULL_SWEEP", "level": n_sl, "score": 3}
-    if p_high > n_sh * 1.0005 and l_close < n_sh:
-        return {"type": "BEAR_SWEEP", "level": n_sh, "score": 3}
-    return None
-
-
-def detect_order_blocks(candles):
-    obs   = []
-    start = max(0, len(candles) - 30)
-    for i in range(start, len(candles) - 3):
-        ci, cn = candles[i], candles[i+1]
-        imp = abs(cn["c"] - cn["o"]) / (cn["o"] + 1e-9)
-        if ci["c"] < ci["o"] and cn["c"] > cn["o"] and imp > 0.0015:
-            obs.append({"type": "BULL", "top": max(ci["o"], ci["c"]),
-                        "bot": min(ci["o"], ci["c"]), "score": 2})
-        if ci["c"] > ci["o"] and cn["c"] < cn["o"] and imp > 0.0015:
-            obs.append({"type": "BEAR", "top": max(ci["o"], ci["c"]),
-                        "bot": min(ci["o"], ci["c"]), "score": 2})
-    return obs[-5:]
-
-
-def detect_fvg(candles):
-    fvgs = []
-    for i in range(2, len(candles)):
-        c1, c3 = candles[i-2], candles[i]
-        if c3["l"] > c1["h"] and (c3["l"]-c1["h"])/(c1["h"]+1e-9) >= FVG_MIN_PCT:
-            fvgs.append({"type": "BULL", "top": c3["l"], "bot": c1["h"], "score": 2})
-        if c1["l"] > c3["h"] and (c1["l"]-c3["h"])/(c3["h"]+1e-9) >= FVG_MIN_PCT:
-            fvgs.append({"type": "BEAR", "top": c1["l"], "bot": c3["h"], "score": 2})
-    return fvgs[-8:]
-
-
-def detect_breaker_block(candles):
-    obs = detect_order_blocks(candles)
-    lc, lh, ll = candles[-1]["c"], candles[-1]["h"], candles[-1]["l"]
-    for ob in reversed(obs):
-        if ob["type"] == "BULL" and lc < ob["bot"] and lh >= ob["bot"]*0.998:
-            return {"type": "BEAR_BB", "top": ob["top"], "bot": ob["bot"], "score": 3}
-        if ob["type"] == "BEAR" and lc > ob["top"] and ll <= ob["top"]*1.002:
-            return {"type": "BULL_BB", "top": ob["top"], "bot": ob["bot"], "score": 3}
-    return None
-
-
-def detect_double_pattern(candles):
-    sh_idx, sl_idx = detect_swings(candles)
-    tol = 0.002
-    if len(sh_idx) >= 2:
-        h1, h2 = candles[sh_idx[-2]]["h"], candles[sh_idx[-1]]["h"]
-        if abs(h1-h2)/h1 <= tol and candles[-1]["c"] < min(h1, h2):
-            return {"type": "SHORT", "setup": "DOUBLE_TOP", "score": 2}
-    if len(sl_idx) >= 2:
-        l1, l2 = candles[sl_idx[-2]]["l"], candles[sl_idx[-1]]["l"]
-        if abs(l1-l2)/l1 <= tol and candles[-1]["c"] > max(l1, l2):
-            return {"type": "LONG", "setup": "DOUBLE_BOTTOM", "score": 2}
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ ANALYSE COMPLÈTE (SMC + Claude + Fondamentaux)
-# ═══════════════════════════════════════════════════════════════════
-def analyze(symbol, volatility_24h=0.0):
-    candles = get_klines(symbol)
-    if not candles or len(candles) < 50:
-        return None, None
-
-    entry     = candles[-1]["c"]
-    atr       = compute_atr(candles)
-    score     = 0
-    direction = None
-    setups    = []
-
-    bos = detect_bos_choch(candles)
-    if bos:
-        direction = bos["type"]
-        score    += bos["score"]
-        setups.append(bos["setup"])
-
-    if not direction:
-        return None, None
-
-    sw = detect_liq_sweep(candles)
-    if sw:
-        d = "LONG" if sw["type"] == "BULL_SWEEP" else "SHORT"
-        if d == direction:
-            score += sw["score"]
-            setups.append(sw["type"])
-
-    for ob in reversed(detect_order_blocks(candles)):
-        d = "LONG" if ob["type"] == "BULL" else "SHORT"
-        if d == direction and ob["bot"]*0.998 <= entry <= ob["top"]*1.002:
-            score += ob["score"]
-            setups.append(f"OB_{ob['type']}")
-            break
-
-    for fvg in reversed(detect_fvg(candles)):
-        d = "LONG" if fvg["type"] == "BULL" else "SHORT"
-        if d == direction and fvg["bot"]*0.999 <= entry <= fvg["top"]*1.001:
-            score += fvg["score"]
-            setups.append(f"FVG_{fvg['type']}")
-            break
-
-    bb = detect_breaker_block(candles)
-    if bb:
-        d = "LONG" if bb["type"] == "BULL_BB" else "SHORT"
-        if d == direction:
-            score += bb["score"]
-            setups.append(bb["type"])
-
-    dt = detect_double_pattern(candles)
-    if dt and dt["type"] == direction:
-        score += dt["score"]
-        setups.append(dt["setup"])
-
-    if score < MIN_SCORE:
-        return None, None
-
-    # ── Claude AI — Analyse Fondamentale + Web Search
-    ai = claude_analyze(symbol, direction, setups, score, volatility_24h)
-
-    if ai.get("score_ai", 1) == 0:
-        log(f"  🤖 Claude BLOQUE {symbol}: {ai.get('reason','')}")
-        return None, None
-
-    # ── Risk Management
-    sl_dist = atr * SL_ATR_MULT
-    if sl_dist <= 0 or entry <= 0:
-        return None, None
-
-    sl = entry - sl_dist if direction == "LONG" else entry + sl_dist
-    tp = entry + sl_dist * TP_RATIO if direction == "LONG" else entry - sl_dist * TP_RATIO
-
-    raw_qty = (RISK_USD / sl_dist) * LEVERAGE
-    si      = get_sym_info(symbol)
-    qty     = max(round_step(raw_qty, si["step"]), si["min_qty"])
-
-    margin_needed = (qty * entry) / LEVERAGE
-    if margin_needed > CAPITAL * 0.9:
-        return None, None
-
-    sig = {
-        "symbol": symbol, "direction": direction,
-        "entry": entry, "sl": sl, "tp": tp,
-        "qty": qty, "score": score, "setups": setups,
-        "atr": atr, "volatility_24h": volatility_24h
-    }
-    return sig, ai
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ GESTION DES POSITIONS
-# ═══════════════════════════════════════════════════════════════════
-def get_positions():
-    data = bget("/fapi/v2/positionRisk", {}, signed=True)
-    if not data:
-        return []
-    return [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
-
-
-def get_current_price(symbol):
-    data = bget("/fapi/v1/ticker/price", {"symbol": symbol})
-    if data:
-        return float(data.get("price", 0))
-    return 0
-
-
-def set_leverage_margin(symbol, lev):
-    try:
-        bpost("/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"})
-    except Exception:
-        pass
-    bpost("/fapi/v1/leverage", {"symbol": symbol, "leverage": lev})
-
-
-def cancel_open_orders(symbol):
-    bpost("/fapi/v1/allOpenOrders", {"symbol": symbol})
-
-
-def close_position(symbol, qty, direction):
-    """Clôture une position au marché."""
-    side = "SELL" if direction == "LONG" else "BUY"
-    r = bpost("/fapi/v1/order", {
-        "symbol": symbol, "side": side,
-        "type": "MARKET", "quantity": qty,
-        "positionSide": "BOTH",
-        "reduceOnly": "true"
-    })
-    return r is not None
-
-
-def place_order(sig, ai):
-    sym  = sig["symbol"]
-    side = "BUY" if sig["direction"] == "LONG" else "SELL"
-    cside = "SELL" if side == "BUY" else "BUY"
-    qty  = sig["qty"]
-    si   = get_sym_info(sym)
-
-    set_leverage_margin(sym, LEVERAGE)
-    cancel_open_orders(sym)
-
-    # Ordre d'entrée
-    r = bpost("/fapi/v1/order", {
-        "symbol": sym, "side": side,
-        "type": "MARKET", "quantity": qty,
-        "positionSide": "BOTH"
-    })
-    if not r:
-        return False
-
-    sl_p = price_str(sig["sl"], si["tick"])
-    tp_p = price_str(sig["tp"], si["tick"])
-
-    # Stop Loss
-    bpost("/fapi/v1/order", {
-        "symbol": sym, "side": cside,
-        "type": "STOP_MARKET", "stopPrice": sl_p,
-        "closePosition": "true", "positionSide": "BOTH"
-    })
-
-    # Take Profit
-    bpost("/fapi/v1/order", {
-        "symbol": sym, "side": cside,
-        "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_p,
-        "closePosition": "true", "positionSide": "BOTH"
-    })
-
-    # Initialiser trailing data
-    _trailing_data[sym] = {
-        "highest": sig["entry"],
-        "lowest":  sig["entry"],
-        "atr":     sig["atr"],
-        "direction": sig["direction"],
-        "entry":   sig["entry"],
-        "qty":     qty,
-        "ai_rec":  ai.get("close_recommendation", "ATTENDRE_TP"),
-        "sig":     sig,
-        "ai":      ai
-    }
-
-    log(f"  ✅ {side} {qty} {sym} | SL:{sl_p} TP:{tp_p}")
-    tg_signal(sig, ai)
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ TRAILING STOP LOGIC
-# ═══════════════════════════════════════════════════════════════════
-def update_trailing_stops(open_symbols):
-    """
-    Met à jour les trailing stops pour toutes les positions ouvertes.
-    Décision de clôture basée sur:
-    - Trailing Stop (SL suiveur)
-    - Recommandation Claude AI
-    - Objectif journalier atteint
-    """
-    global _daily_pnl, _daily_trades
-
-    symbols_to_remove = []
-
-    for symbol, td in list(_trailing_data.items()):
-        if symbol not in open_symbols:
-            symbols_to_remove.append(symbol)
-            continue
-
-        current_price = get_current_price(symbol)
-        if current_price <= 0:
-            continue
-
-        direction = td["direction"]
-        entry     = td["entry"]
-        atr       = td["atr"]
-        qty       = td["qty"]
-        ai_rec    = td["ai_rec"]
-        si        = get_sym_info(symbol)
-
-        # Calcul PnL actuel
-        if direction == "LONG":
-            pnl_per_unit = current_price - entry
-        else:
-            pnl_per_unit = entry - current_price
-        pnl_usd = pnl_per_unit * qty * LEVERAGE
-
-        activation_dist = atr * TRAILING_ACTIVATION
-        trailing_dist   = atr * TRAILING_DISTANCE_ATR
-
-        should_close  = False
-        close_reason  = ""
-
-        # 1. Clôture si Claude recommande immédiatement
-        if ai_rec == "CLOTURER_MAINTENANT" and pnl_usd > 0:
-            should_close = True
-            close_reason = "Claude AI: clôture recommandée"
-
-        # 2. Trailing Stop — mettre à jour le highest/lowest
-        if TRAILING_ENABLED:
-            if direction == "LONG":
-                if current_price > td["highest"]:
-                    td["highest"] = current_price
-                # Activer trailing si profit > activation_dist
-                profit_dist = td["highest"] - entry
-                if profit_dist >= activation_dist:
-                    trail_level = td["highest"] - trailing_dist
-                    if current_price <= trail_level and not should_close:
-                        should_close = True
-                        close_reason = f"Trailing SL déclenché @ {current_price:.4f}"
-            else:
-                if current_price < td["lowest"]:
-                    td["lowest"] = current_price
-                profit_dist = entry - td["lowest"]
-                if profit_dist >= activation_dist:
-                    trail_level = td["lowest"] + trailing_dist
-                    if current_price >= trail_level and not should_close:
-                        should_close = True
-                        close_reason = f"Trailing SL déclenché @ {current_price:.4f}"
-
-        # 3. Objectif journalier atteint → sécuriser les profits
-        if _daily_pnl + pnl_usd >= DAILY_TARGET and pnl_usd > 0:
-            should_close = True
-            close_reason = f"🎯 Objectif journalier atteint (${_daily_pnl + pnl_usd:.2f})"
-
-        if should_close:
-            log(f"  🔄 Clôture {symbol} {direction} | PnL: ${pnl_usd:.2f} | {close_reason}")
-            if close_position(symbol, qty, direction):
-                cancel_open_orders(symbol)
-                _daily_pnl   += pnl_usd
-                _daily_trades += 1
-                tg_trade_closed(symbol, direction, pnl_usd, close_reason, ai_rec)
-                symbols_to_remove.append(symbol)
-
-                if _daily_pnl >= DAILY_TARGET:
-                    log(f"🎯 OBJECTIF JOURNALIER ATTEINT: ${_daily_pnl:.2f}")
-                    tg_daily_summary()
-
-    for s in symbols_to_remove:
-        _trailing_data.pop(s, None)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ RESET JOURNALIER
-# ═══════════════════════════════════════════════════════════════════
-def check_daily_reset():
-    global _daily_pnl, _daily_trades, _daily_date
-    today = date.today()
-    if today != _daily_date:
-        tg_daily_summary()
-        _daily_pnl    = 0.0
-        _daily_trades = 0
-        _daily_date   = today
-        log(f"📅 Nouveau jour: reset compteurs journaliers")
-
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ FLASK KEEP-ALIVE — Render Free Tier anti-sleep
-# ═══════════════════════════════════════════════════════════════════
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return jsonify({
-        "status": "running",
-        "bot": "AlphaBot V7",
-        "pnl_jour": round(_daily_pnl, 2),
-        "objectif": DAILY_TARGET,
-        "trades": _daily_trades,
-        "heure": datetime.now().strftime("%H:%M:%S")
-    })
-
-@flask_app.route("/ping")
-def ping():
-    return "pong", 200
-
-@flask_app.route("/status")
-def status():
-    pct = (_daily_pnl / DAILY_TARGET * 100) if DAILY_TARGET > 0 else 0
-    return jsonify({
-        "status":        "actif",
-        "pnl_jour":      round(_daily_pnl, 2),
-        "objectif":      DAILY_TARGET,
-        "progression":   f"{pct:.1f}%",
-        "trades_jour":   _daily_trades,
-        "capital":       CAPITAL,
-        "levier":        LEVERAGE,
-        "trailing_sl":   TRAILING_ENABLED,
-        "claude_ai":     USE_CLAUDE_AI,
-        "timestamp":     datetime.now().isoformat()
-    })
-
-def start_keepalive():
-    port = int(os.environ.get("PORT", 10000))
-    t = threading.Thread(
-        target=lambda: flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
-        daemon=True
-    )
-    t.start()
-    log(f"✅ Flask keep-alive démarré sur port {port}")
-    log(f"   → Routes: / | /ping | /status")
-
-# ═══════════════════════════════════════════════════════════════════
-#  ██ MAIN LOOP
-# ═══════════════════════════════════════════════════════════════════
-def banner():
-    ai_status = "✅ Activé + Web Search" if (USE_CLAUDE_AI and len(ANTHROPIC_API_KEY) > 20) else "⚠️  Configurez ANTHROPIC_API_KEY"
-    print()
-    print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║   AlphaBot V7 — SMC + Claude AI + Trailing SL + Objectif $7/jour    ║")
-    print(f"║  Capital: ${CAPITAL}  |  Risque: ${RISK_USD}/trade  |  Levier: {LEVERAGE}x             ║")
-    print(f"║  Scanner: Top {TOP_N} grands marchés crypto  |  M1  |  Score min: {MIN_SCORE}    ║")
-    print(f"║  Objectif: ${DAILY_TARGET}/jour  |  Max perte: ${DAILY_MAX_LOSS}/jour              ║")
-    print(f"║  Trailing SL: {TRAILING_ACTIVATION}x ATR activation, {TRAILING_DISTANCE_ATR}x ATR distance          ║")
-    print(f"║  Claude AI : {ai_status:<44}║")
-    print("╚══════════════════════════════════════════════════════════════════════╝")
-    print()
+            if not sess.is_trading_allowed():
+                logger.info("Hors session — pause scanner")
+                await asyncio.sleep(60)
+                continue
+
+            if sess.is_news_window():
+                logger.info("News window — scanner suspendu")
+                await asyncio.sleep(60)
+                continue
+
+            if not sm.can_send():
+                logger.info("Limite 10 signaux atteinte")
+                await asyncio.sleep(300)
+                continue
+
+            session = sess.current_session()
+
+            for symbol, minfo in config.MARKETS.items():
+                if not sm.can_send():
+                    break
+
+                price_data = get_price(symbol)
+                if price_data and price_data["spread"] > minfo["spread_max"]:
+                    logger.debug(f"Spread trop large {symbol}: {price_data['spread']:.5f}")
+                    continue
+
+                h4  = get_candles(symbol, config.TF_TREND, config.CANDLE_COUNT)
+                m15 = get_candles(symbol, config.TF_ZONE,  config.CANDLE_COUNT)
+                m1  = get_candles(symbol, config.TF_ENTRY, 100)
+
+                signal = engine.analyze(symbol, h4, m15, m1, session)
+
+                if not signal:
+                    presignal_sent.discard(symbol)
+                    await asyncio.sleep(1)
+                    continue
+
+                if signal.score >= 70 and symbol not in presignal_sent:
+                    pre_msg = sm.format_presignal(symbol, signal.direction,
+                                                   signal.setup.value, session)
+                    if config.LEADER_CHAT_ID:
+                        await app.bot.send_message(
+                            chat_id=config.LEADER_CHAT_ID,
+                            text=pre_msg,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                    presignal_sent.add(symbol)
+
+                if signal.score >= config.MIN_SCORE and signal.rr >= config.MIN_RR:
+                    msg = sm.format_signal(signal, count=sm.count_today() + 1)
+
+                    if config.CHANNEL_ID:
+                        await app.bot.send_message(
+                            chat_id=config.CHANNEL_ID,
+                            text=msg,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+
+                    if config.LEADER_CHAT_ID:
+                        await app.bot.send_message(
+                            chat_id=config.LEADER_CHAT_ID,
+                            text=f"✅ Signal auto envoyé : *{symbol}* {signal.direction.value} | Score {signal.score} | RR 1:{signal.rr}",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+
+                    sm.record(signal)
+                    presignal_sent.discard(symbol)
+                    await asyncio.sleep(3)
+
+                await asyncio.sleep(1)
+
+        except Exception as exc:
+            logger.error(f"Scanner exception: {exc}", exc_info=True)
+
+        await asyncio.sleep(config.SCAN_INTERVAL_SECONDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _post_init(app: Application):
+    """Start background scanner after bot is ready."""
+    asyncio.create_task(_scanner(app))
 
 
 def main():
-    banner()
-    start_keepalive()  # Render keep-alive — DOIT rester vivant même si Binance KO
+    if not config.TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN manquant dans les variables d'environnement")
 
-    # ── Démarrer Telegram EN FOND immédiatement (n'attend PAS Binance)
-    tg_thread = threading.Thread(target=_tg_background_loop, daemon=True)
-    tg_thread.start()
-    log("📱 Thread Telegram démarré en arrière-plan")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.warning("⚠️  ANTHROPIC_API_KEY non défini — commande /ia désactivée")
 
-    # Retry Binance jusqu'à connexion (ne jamais quitter = Render ne redémarre pas)
-    retry_count = 0
-    while not detect_binance_url():
-        retry_count += 1
-        log(f"⏳ Binance inaccessible — retry {retry_count} dans 30s...")
-        tg_send("⚠️ <b>AlphaBot V7</b> : Binance inaccessible, nouvelle tentative dans 30s...")
-        # Tous les 3 échecs, rafraîchir la liste de proxies
-        if retry_count % 3 == 0:
-            log("🔄 Rafraîchissement de la liste de proxies...")
-            _proxy_list.clear()
-            fetch_free_proxies()
-        time.sleep(30)
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
-    log(f"✅ Binance connecté : {BASE_URL}")
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("price",   cmd_price))
+    app.add_handler(CommandHandler("trend",   cmd_trend))
+    app.add_handler(CommandHandler("zones",   cmd_zones))
+    app.add_handler(CommandHandler("entry",   cmd_entry))
+    app.add_handler(CommandHandler("ia",      cmd_ia))
+    app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
 
-    # Si le welcome n'a pas encore été envoyé (pas de Chat ID détecté avant),
-    # on l'envoie maintenant que Binance est connecté
-    global _welcome_sent
-    if TG_CHAT_ID and not _welcome_sent:
-        tg_welcome()
-        _welcome_sent = True
-
-    scan_n  = 0
-    sig_tot = 0
-
-    while True:
-        try:
-            check_daily_reset()
-
-            # Stop si perte journalière max atteinte — on dort 1h, on ne quitte pas
-            if _daily_pnl <= -DAILY_MAX_LOSS:
-                log(f"🛑 Perte max journalière atteinte: ${_daily_pnl:.2f}")
-                tg_send(f"🛑 <b>Stop trading — Perte max atteinte: ${_daily_pnl:.2f}</b>")
-                time.sleep(3600)
-                continue
-
-            # Vérifier que Binance est toujours accessible
-            if not BASE_URL:
-                log("⚠️ Binance perdu — reconnexion...")
-                detect_binance_url()
-                time.sleep(30)
-                continue
-
-            # Stop si objectif déjà atteint aujourd'hui
-            if _daily_pnl >= DAILY_TARGET:
-                log(f"🎯 Objectif atteint (${_daily_pnl:.2f}), surveillance uniquement")
-                positions     = get_positions()
-                open_symbols  = {p["symbol"] for p in positions}
-                update_trailing_stops(open_symbols)
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            scan_n += 1
-            log(f"══════ SCAN #{scan_n} | PnL: ${_daily_pnl:.2f}/${DAILY_TARGET} {'═'*20}")
-
-            positions    = get_positions()
-            open_symbols = {p["symbol"] for p in positions}
-            open_count   = len(positions)
-
-            # Écouter les commandes Telegram (boutons, /menu, etc.)
-            tg_get_chat_id()
-
-            # Mettre à jour les trailing stops SILENCIEUSEMENT (pas de message Telegram)
-            update_trailing_stops(open_symbols)
-
-            log(f"📊 Positions: {open_count}/{MAX_TRADES}")
-
-            if open_count >= MAX_TRADES:
-                log("⚠️  Limite atteinte. Surveillance trailing stops...")
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            slots = MAX_TRADES - open_count
-
-            # Scanner les cryptos les plus volatiles
-            volatile_pairs = get_top_volatile(TOP_N)
-            volatile_dict  = {sym: vol for sym, vol in volatile_pairs}
-            symbols        = [sym for sym, _ in volatile_pairs if sym not in open_symbols]
-
-            log(f"🔍 Scanner: {[s for s, v in volatile_pairs[:5]]} (top 5 volatils)")
-
-            signals = []
-            for sym in symbols:
-                vol = volatile_dict.get(sym, 0)
-                sig, ai = analyze(sym, vol)
-                if sig:
-                    signals.append((sig, ai))
-                    ai_score = ai.get("score_ai", 0) if ai else 0
-                    log(f"   📡 {sig['direction']} {sym} | SMC:{sig['score']} + AI:{ai_score} | {sig['setups']}")
-                time.sleep(0.3)
-
-            # Trier par score total
-            signals.sort(
-                key=lambda x: x[0]["score"] + x[1].get("score_ai", 0),
-                reverse=True
-            )
-
-            placed = 0
-            for sig, ai in signals[:slots]:
-                total = sig["score"] + ai.get("score_ai", 0)
-                log(f"🚀 {sig['direction']} {sig['symbol']} (score total {total})")
-                ok = place_order(sig, ai)
-                if ok:
-                    placed  += 1
-                    sig_tot += 1
-                time.sleep(0.5)
-
-            if placed == 0 and not signals:
-                log("💤 Aucun signal valide ce scan.")
-
-            log(f"📈 Signaux session: {sig_tot}")
-
-        except KeyboardInterrupt:
-            log("🛑 Arrêt.")
-            tg_daily_summary()
-            tg_send("🛑 <b>AlphaBot V7 arrêté manuellement.</b>")
-            break
-        except Exception as e:
-            import traceback
-            log(f"[ERREUR] {e}")
-            log(traceback.format_exc())
-            time.sleep(10)  # Pause courte puis continue — ne jamais quitter
-
-        log(f"⏳ Prochain scan dans {SCAN_INTERVAL}s...\n")
-        time.sleep(SCAN_INTERVAL)
+    logger.info("AlphaBot SMC PRO + Claude AI démarré")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
