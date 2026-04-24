@@ -1,16 +1,7 @@
+
 pandas
 numpy
 requests
 flask
 python-telegram-bot
 config.py
-signal_manager.py
-session_manager.py
-market_data.py
-smc_engine.py
-requirements.txt
-python-telegram-bot
-anthropic
-pandas
-numpy
-requests
