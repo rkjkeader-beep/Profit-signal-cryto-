@@ -1,3 +1,4 @@
+
 """
 main.py — AlphaBot SMC PRO (Leader ODG)
 Telegram bot + auto-scanner 30 secondes
@@ -8,9 +9,8 @@ import asyncio
 import logging
 import os
 
-# ─── TOKENS (fallback si variables d'environnement absentes) ──────────────────
-os.environ.setdefault("TELEGRAM_TOKEN",    "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
-os.environ.setdefault("ANTHROPIC_API_KEY", "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")
+# ─── TOKENS (définis via variables d'environnement uniquement) ────────────────
+# Configurer TELEGRAM_TOKEN et ANTHROPIC_API_KEY dans les variables d'env du serveur
 
 # ─── Imports standard ─────────────────────────────────────────────────────────
 try:
@@ -76,7 +76,7 @@ async def analyse_with_claude(symbol: str, trend_info: dict, zones_info: dict, s
     try:
         client = anthropic.AsyncAnthropic(api_key=api_key)
         response = await client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-opus-4-6",
             max_tokens=700,
             system=_CLAUDE_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
