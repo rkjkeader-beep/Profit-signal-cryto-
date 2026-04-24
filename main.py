@@ -1,5 +1,6 @@
 
 
+
 """
 main.py — AlphaBot SMC PRO (LIVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -50,7 +51,7 @@ log = logging.getLogger("alphabot")
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8665812395")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8665812395c")
 
 MARKETS = {
     "BTCUSD": {"source": "binance",  "binance_sym": "BTCUSDT", "digits": 1, "pip": 1,   "spread_max": 5},
