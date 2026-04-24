@@ -6,3 +6,4 @@ flask
 python-telegram-bot
 config.py
 anthropic
+plotly
