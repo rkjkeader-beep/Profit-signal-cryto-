@@ -356,18 +356,27 @@ def get_session() -> str:
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 
-def send_telegram(text: str):
+def send_telegram(text: str) -> bool:
+    """Envoie un message Telegram. Retourne True si succès."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        log.warning("Telegram: TOKEN ou CHAT_ID manquant — message non envoyé")
+        return False
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=8,
+            timeout=10,
         )
-        log.info("Telegram ✓")
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            log.info(f"Telegram ✓ message_id={data['result']['message_id']}")
+            return True
+        else:
+            log.error(f"Telegram erreur HTTP {resp.status_code}: {data}")
+            return False
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        log.error(f"Telegram exception: {e}")
+        return False
 
 
 def format_signal(symbol: str, sig: dict, session: str, digits: int) -> str:
@@ -583,15 +592,16 @@ def zone_toggle(key, label, color):
 
 
 app.layout = html.Div([
-    dcc.Store(id="s-symbol",  data="BTCUSD"),
-    dcc.Store(id="s-tf",      data="M15"),
-    dcc.Store(id="s-candles", data=None),
-    dcc.Store(id="s-zones",   data=None),
-    dcc.Store(id="s-trend",   data="NEUTRE"),
-    dcc.Store(id="s-struct",  data={}),
-    dcc.Store(id="s-signal",  data=None),
-    dcc.Store(id="s-price",   data=None),
-    dcc.Store(id="s-alerts",  data=[]),
+    dcc.Store(id="s-symbol",      data="BTCUSD"),
+    dcc.Store(id="s-tf",          data="M15"),
+    dcc.Store(id="s-candles",     data=None),
+    dcc.Store(id="s-zones",       data=None),
+    dcc.Store(id="s-trend",       data="NEUTRE"),
+    dcc.Store(id="s-struct",      data={}),
+    dcc.Store(id="s-signal",      data=None),
+    dcc.Store(id="s-price",       data=None),
+    dcc.Store(id="s-alerts",      data=[]),
+    dcc.Store(id="s-last-signal", data=None),   # clé anti-doublon Telegram
 
     dcc.Interval(id="iv-candles", interval=REFRESH_INTERVAL_MS, n_intervals=0),
     dcc.Interval(id="iv-tick",    interval=TICK_INTERVAL_MS,    n_intervals=0),
@@ -678,6 +688,21 @@ app.layout = html.Div([
                 }),
             ], style={"padding":"10px 14px","borderBottom":f"1px solid {DARK['border']}"}),
 
+            # ── BOUTON TEST TELEGRAM ──────────────────────────────────────────
+            html.Div([
+                html.Button("📨  TEST TELEGRAM", id="btn-tg-test", n_clicks=0, style={
+                    "width":"100%","padding":"8px","borderRadius":5,"cursor":"pointer",
+                    "border":"1px solid #4a8fff",
+                    "background":"rgba(74,143,255,0.10)",
+                    "color":"#4a8fff","fontSize":10,
+                    "fontFamily":"Courier New,monospace","letterSpacing":2,
+                }),
+                html.Div(id="tg-test-result", style={
+                    "marginTop":5,"fontSize":9,"color":DARK["text"],
+                    "fontFamily":"Courier New,monospace","minHeight":14,
+                }),
+            ], style={"padding":"8px 14px","borderBottom":f"1px solid {DARK['border']}"}),
+
             dcc.Loading(type="circle", color=DARK["accent"], children=
                 html.Div(id="ia-output", style={
                     "flex":1,"padding":"12px 14px","overflowY":"auto",
@@ -704,6 +729,24 @@ app.layout = html.Div([
 
 # ─── CALLBACKS ────────────────────────────────────────────────────────────────
 
+# FIX : mise à jour visuelle des boutons symbole quand la sélection change
+@app.callback(
+    Output("sym-buttons","children"),
+    Input("s-symbol","data"),
+)
+def cb_sym_buttons(symbol):
+    return [sym_btn(s, symbol) for s in MARKETS]
+
+
+# FIX : mise à jour visuelle des boutons timeframe quand la sélection change
+@app.callback(
+    Output("tf-buttons","children"),
+    Input("s-tf","data"),
+)
+def cb_tf_buttons(tf):
+    return [tf_btn(t, tf) for t in TIMEFRAMES]
+
+
 @app.callback(
     Output("s-symbol","data"),
     [Input({"type":"sym-btn","index":s},"n_clicks") for s in MARKETS],
@@ -727,17 +770,21 @@ def cb_tf(*_):
 
 
 @app.callback(
-    Output("s-candles","data"),
-    Output("s-zones",  "data"),
-    Output("s-trend",  "data"),
-    Output("s-struct", "data"),
-    Output("s-signal", "data"),
-    Input("s-symbol",  "data"),
-    Input("s-tf",      "data"),
-    Input("iv-candles","n_intervals"),
-    Input("btn-refresh","n_clicks"),
+    Output("s-candles",     "data"),
+    Output("s-zones",       "data"),
+    Output("s-trend",       "data"),
+    Output("s-struct",      "data"),
+    Output("s-signal",      "data"),
+    Output("s-alerts",      "data"),       # FIX : maintenant mis à jour
+    Output("s-last-signal", "data"),       # FIX : anti-doublon Telegram
+    Input("s-symbol",       "data"),
+    Input("s-tf",           "data"),
+    Input("iv-candles",     "n_intervals"),
+    Input("btn-refresh",    "n_clicks"),
+    State("s-alerts",       "data"),
+    State("s-last-signal",  "data"),
 )
-def cb_load_candles(symbol, tf, _iv, _btn):
+def cb_load_candles(symbol, tf, _iv, _btn, alerts, last_signal_key):
     df = get_candles(symbol, tf)
 
     if df is None or df.empty:
@@ -749,10 +796,29 @@ def cb_load_candles(symbol, tf, _iv, _btn):
     struct  = detect_bos_choch(df)
     signal  = score_signal(df, zones, trend)
 
+    alerts = list(alerts or [])
+
     if signal:
         sess = get_session()
-        msg  = format_signal(symbol, signal, sess, MARKETS[symbol]["digits"])
-        threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
+        digits = MARKETS[symbol]["digits"]
+
+        # Clé unique pour éviter d'envoyer Telegram à chaque refresh (30s)
+        # On identifie un signal par : symbole + TF + direction + entry arrondi
+        sig_key = f"{symbol}_{tf}_{signal['direction']}_{signal['entry']:.{digits}f}"
+
+        if sig_key != last_signal_key:
+            msg = format_signal(symbol, signal, sess, digits)
+            threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
+            last_signal_key = sig_key
+            log.info(f"Nouveau signal Telegram envoyé : {sig_key}")
+
+        # Ajout au log d'alertes affiché dans le panel
+        ts = datetime.utcnow().strftime("%H:%M")
+        direction_label = "BUY" if signal["direction"] == "bull" else "SELL"
+        alert_line = f"[{ts}] {symbol} {tf} {direction_label} | Score {signal['score']} | RR 1:{signal['rr']}"
+        if not alerts or alerts[-1] != alert_line:
+            alerts.append(alert_line)
+            alerts = alerts[-20:]  # garder les 20 derniers
 
     return (
         df.to_json(orient="records", date_format="iso"),
@@ -760,15 +826,17 @@ def cb_load_candles(symbol, tf, _iv, _btn):
         trend,
         struct,
         signal,
+        alerts,
+        last_signal_key,
     )
 
 
 @app.callback(
-    Output("s-price",   "data"),
-    Output("live-price","children"),
-    Input("iv-tick",    "n_intervals"),
-    State("s-symbol",   "data"),
-    State("s-price",    "data"),
+    Output("s-price",    "data"),
+    Output("live-price", "children"),
+    Input("iv-tick",     "n_intervals"),
+    State("s-symbol",    "data"),
+    State("s-price",     "data"),
 )
 def cb_tick(_, symbol, prev_price):
     price = get_price(symbol)
@@ -888,7 +956,7 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     if len(rows) == 1:
         rows.append(html.Div("Aucune zone détectée",style={"color":DARK["text"]}))
 
-    alert_rows = [html.Div(a) for a in (alerts or [])[-8:]] or \
+    alert_rows = [html.Div(a, style={"padding":"1px 0"}) for a in (alerts or [])[-8:]] or \
                  [html.Div("Aucun signal depuis le lancement",style={"color":DARK["border"]})]
 
     return fig, f"{ta} {trend}", trend_style, struct_txt, sig_txt, sig_style, rows, alert_rows
@@ -923,6 +991,36 @@ def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
     ])
 
 
+# ─── CALLBACK TEST TELEGRAM ───────────────────────────────────────────────────
+
+@app.callback(
+    Output("tg-test-result","children"),
+    Output("tg-test-result","style"),
+    Input("btn-tg-test","n_clicks"),
+    prevent_initial_call=True,
+)
+def cb_tg_test(n):
+    if not n:
+        raise PreventUpdate
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return ("❌ TOKEN ou CHAT_ID manquant dans les variables Render",
+                {"color":DARK["bear"],"fontSize":9,"fontFamily":"Courier New,monospace","marginTop":5})
+
+    msg = (
+        "🧪 *AlphaBot SMC — TEST*\n"
+        f"Connexion Telegram OK ✅\n"
+        f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
+    )
+    ok = send_telegram(msg)
+    if ok:
+        return ("✅ Message envoyé !",
+                {"color":DARK["bull"],"fontSize":9,"fontFamily":"Courier New,monospace","marginTop":5})
+    else:
+        return ("❌ Échec — vérifie TOKEN et CHAT_ID dans les logs Render",
+                {"color":DARK["bear"],"fontSize":9,"fontFamily":"Courier New,monospace","marginTop":5})
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -939,3 +1037,4 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8050))
     app.run(debug=False, host="0.0.0.0", port=port)
+
