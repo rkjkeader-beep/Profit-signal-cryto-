@@ -71,8 +71,8 @@ DARK = {
     "text":   "#8b95a8", "textHi": "#c8d0de",
 }
 
-MIN_SCORE = 75
-MIN_RR    = 3.0
+MIN_SCORE = 60
+MIN_RR    = 2.0
 
 
 # ─── DONNÉES BINANCE ──────────────────────────────────────────────────────────
@@ -180,16 +180,38 @@ def get_gold_price_live() -> float | None:
 def get_candles(symbol: str, tf: str) -> pd.DataFrame | None:
     cfg = MARKETS[symbol]
     if cfg["source"] == "binance":
-        return get_binance_candles(cfg["binance_sym"], tf)
+        df = get_binance_candles(cfg["binance_sym"], tf)
+        if df is None or df.empty:
+            log.warning(f"Binance vide pour {symbol} {tf} — fallback yfinance BTC-USD")
+            df = get_yfinance_candles("BTC-USD", tf)
+        if df is None or df.empty:
+            log.error(f"Aucune donnée disponible pour {symbol} {tf}")
+            return None
+        log.info(f"{symbol} {tf} — {len(df)} bougies chargées (close={df['close'].iloc[-1]:.2f})")
+        return df
     elif cfg["source"] == "yfinance":
-        return get_yfinance_candles(cfg["yf_sym"], tf)
+        df = get_yfinance_candles(cfg["yf_sym"], tf)
+        if df is None or df.empty:
+            log.error(f"yfinance vide pour {symbol} {tf}")
+            return None
+        log.info(f"{symbol} {tf} — {len(df)} bougies chargées (close={df['close'].iloc[-1]:.2f})")
+        return df
     return None
 
 
 def get_price(symbol: str) -> float | None:
     cfg = MARKETS[symbol]
     if cfg["source"] == "binance":
-        return get_binance_price(cfg["binance_sym"])
+        p = get_binance_price(cfg["binance_sym"])
+        if p is None:
+            log.warning("Binance price fail — fallback yfinance BTC-USD")
+            try:
+                t = yf.Ticker("BTC-USD")
+                h = t.history(period="1d", interval="1m")
+                p = float(h["Close"].iloc[-1]) if not h.empty else None
+            except Exception as e:
+                log.error(f"yfinance BTC price fallback error: {e}")
+        return p
     elif cfg["source"] == "yfinance":
         return get_gold_price_live()
     return None
@@ -409,12 +431,16 @@ def score_signal(df: pd.DataFrame, zones: dict, trend: str) -> dict | None:
         score += 15
 
     if score < MIN_SCORE or entry is None or sl is None:
+        log.info(f"score_signal rejeté — score={score} entry={entry} sl={sl} "
+                 f"(MIN_SCORE={MIN_SCORE}, price={last:.4f})")
         return None
 
     rr = abs(tp - entry) / abs(entry - sl) if sl and tp else 0
     if rr < MIN_RR:
+        log.info(f"score_signal rejeté — RR={rr:.2f} < {MIN_RR}")
         return None
 
+    log.info(f"✅ Signal validé — score={score} dir={direction} RR={rr:.1f}")
     return {"score": score, "direction": direction, "entry": entry,
             "sl": sl, "tp": tp, "rr": round(rr, 1)}
 
@@ -1277,15 +1303,61 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
 def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
     if not n or not candles_json:
         raise PreventUpdate
-    df = pd.read_json(StringIO(candles_json), orient="records")
-    p  = price or df["close"].iloc[-1]
-    m  = MARKETS[symbol]
-    r  = analyse_claude(symbol, tf, trend, struct or {}, zones or {},
-                        p, get_session(), signal, m["digits"])
+    df  = pd.read_json(StringIO(candles_json), orient="records")
+    p   = price or df["close"].iloc[-1]
+    m   = MARKETS[symbol]
+    sess = get_session()
+    r   = analyse_claude(symbol, tf, trend, struct or {}, zones or {},
+                         p, sess, signal, m["digits"])
+
+    # ── Envoi Telegram automatique après chaque analyse manuelle ──────────────
+    def _send_ia_to_telegram():
+        digits = m["digits"]
+        # Résumé zones pour Telegram
+        def _fmt_zones(items, label):
+            return "\n".join(
+                f"  {label} {'▲' if z['dir']=='bull' else '▼'} "
+                f"{z['low']:.{digits}f}–{z['high']:.{digits}f}"
+                for z in items[-2:]
+            ) if items else ""
+
+        z = zones or {}
+        zones_lines = "\n".join(filter(None, [
+            _fmt_zones(z.get("order_blocks",   []), "OB "),
+            _fmt_zones(z.get("fvg",            []), "FVG"),
+            _fmt_zones(z.get("breaker_blocks", []), "BB "),
+            _fmt_zones(z.get("supply_demand",  []), "S/D"),
+        ])) or "  Aucune zone détectée"
+
+        struct_line = ""
+        if struct:
+            t  = struct.get("trend", "—")
+            bos = struct.get("bos", "—")
+            choch = struct.get("choch", "—")
+            struct_line = f"Structure : {t} | BOS: {bos} | CHoCH: {choch}\n"
+
+        # Tronque l'analyse Claude à 2000 chars (limite Telegram)
+        analyse_short = r[:2000] + ("…" if len(r) > 2000 else "")
+
+        msg = (
+            f"🔍 *ANALYSE IA — {symbol} {tf}*\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC | {sess}\n"
+            f"💰 Prix : `{p:.{digits}f}`\n"
+            f"📈 Tendance : {trend}\n"
+            f"{struct_line}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"*ZONES SMC :*\n{zones_lines}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{analyse_short}"
+        )
+        send_telegram(msg)
+
+    threading.Thread(target=_send_ia_to_telegram, daemon=True).start()
+
     return html.Div([
         html.Div([
             html.Span(f"▸ {symbol} {tf}", style={"color":DARK["accent"],"fontWeight":"bold"}),
-            html.Span(f"  |  {get_session()}  |  {datetime.now(timezone.utc).strftime('%H:%M UTC')}  |  🌐 NEWS LIVE",
+            html.Span(f"  |  {sess}  |  {datetime.now(timezone.utc).strftime('%H:%M UTC')}  |  🌐 NEWS LIVE",
                       style={"color":DARK["text"]}),
         ], style={"display":"flex","alignItems":"center","marginBottom":10,
                   "fontSize":9,"borderBottom":f"1px solid {DARK['border']}","paddingBottom":5}),
@@ -1356,3 +1428,4 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8050))
     app.run(debug=False, host="0.0.0.0", port=port)
+
