@@ -1,6 +1,5 @@
 
 
-
 """
 main.py — AlphaBot SMC PRO (LIVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -468,7 +467,7 @@ def format_signal(symbol: str, sig: dict, session: str, digits: int) -> str:
         f"RR        : 1:{sig['rr']}\n"
         f"Score     : {sig['score']}/100\n"
         f"Session   : {session}\n"
-        f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
+        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
 
 
@@ -710,7 +709,7 @@ def analyse_claude(symbol: str, tf: str, trend: str, structure: dict,
 
     symbol_name  = "Bitcoin (BTC/USD)" if symbol == "BTCUSD" else "Or (XAU/USD)"
     search_hint  = "Bitcoin BTC price crypto news" if symbol == "BTCUSD" else "Gold XAU price commodities news"
-    now_str      = datetime.utcnow().strftime("%d %B %Y %H:%M UTC")
+    now_str      = datetime.now(timezone.utc).strftime("%d %B %Y %H:%M UTC")
     market_phase = _get_market_phase(session, tf)
     correlations = _get_correlations(symbol)
 
@@ -1110,7 +1109,7 @@ def cb_load_candles(symbol, tf, _iv, _btn, alerts, last_signal_key):
             log.info(f"Nouveau signal Telegram envoyé : {sig_key}")
 
         # Ajout au log d'alertes affiché dans le panel
-        ts = datetime.utcnow().strftime("%H:%M")
+        ts = datetime.now(timezone.utc).strftime("%H:%M")
         direction_label = "BUY" if signal["direction"] == "bull" else "SELL"
         alert_line = f"[{ts}] {symbol} {tf} {direction_label} | Score {signal['score']} | RR 1:{signal['rr']}"
         if not alerts or alerts[-1] != alert_line:
@@ -1286,7 +1285,7 @@ def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
     return html.Div([
         html.Div([
             html.Span(f"▸ {symbol} {tf}", style={"color":DARK["accent"],"fontWeight":"bold"}),
-            html.Span(f"  |  {get_session()}  |  {datetime.utcnow().strftime('%H:%M UTC')}  |  🌐 NEWS LIVE",
+            html.Span(f"  |  {get_session()}  |  {datetime.now(timezone.utc).strftime('%H:%M UTC')}  |  🌐 NEWS LIVE",
                       style={"color":DARK["text"]}),
         ], style={"display":"flex","alignItems":"center","marginBottom":10,
                   "fontSize":9,"borderBottom":f"1px solid {DARK['border']}","paddingBottom":5}),
@@ -1313,7 +1312,7 @@ def cb_tg_test(n):
     msg = (
         "🧪 *AlphaBot SMC — TEST*\n"
         f"Connexion Telegram OK ✅\n"
-        f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
+        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
     ok = send_telegram(msg)
     if ok:
@@ -1341,7 +1340,7 @@ if __name__ == "__main__":
     # Message Telegram de démarrage
     startup_msg = (
         "\U0001f7e2 *AlphaBot SMC PRO \u2014 EN LIGNE*\n"
-        f"\u23f0 {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC\n"
+        f"\u23f0 {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\u2705 BTC  \u2192 Binance API\n"
         "\u2705 GOLD \u2192 yfinance + metals.live\n"
