@@ -1,6 +1,5 @@
 
 
-
 """
 main.py — AlphaBot SMC PRO (LIVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -33,6 +32,7 @@ from io import StringIO
 from datetime import datetime, timezone
 
 import anthropic
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -48,9 +48,9 @@ logging.basicConfig(
 log = logging.getLogger("alphabot")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8666812395")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "")
 
 MARKETS = {
     "BTCUSD": {"source": "binance",  "binance_sym": "BTCUSDT", "digits": 1, "pip": 1,   "spread_max": 5},
@@ -208,28 +208,101 @@ def detect_trend(df: pd.DataFrame) -> str:
     return "NEUTRE"
 
 
-def detect_bos_choch(df: pd.DataFrame) -> dict:
+def _find_swings(highs: np.ndarray, lows: np.ndarray,
+                 left: int = 3, right: int = 3) -> tuple[list, list]:
+    """
+    Détecte les vrais swing highs / swing lows structurels.
+
+    Un swing high[i] est valide si high[i] est le plus haut
+    sur la fenêtre [i-left … i+right].
+    Même logique inversée pour swing low.
+
+    left / right = nombre de bougies de confirmation de chaque côté.
+    Plus la valeur est grande, plus le swing est significatif.
+    """
+    n = len(highs)
+    sh, sl = [], []   # indices des swing highs / lows confirmés
+
+    for i in range(left, n - right):
+        window_h = highs[i - left : i + right + 1]
+        window_l = lows [i - left : i + right + 1]
+
+        if highs[i] == np.max(window_h):
+            sh.append(i)
+        if lows[i]  == np.min(window_l):
+            sl.append(i)
+
+    return sh, sl
+
+
+def detect_bos_choch(df: pd.DataFrame, left: int = 3, right: int = 2) -> dict:
+    """
+    BOS  (Break of Structure)  : cassure DANS le sens de la tendance en cours.
+    CHoCH (Change of Character) : cassure À CONTRE-SENS → signal de retournement.
+
+    Logique :
+    ─ On identifie les swing points réels (pas une fenêtre fixe).
+    ─ On suit la séquence HH/HL (uptrend) ou LH/LL (downtrend).
+    ─ BOS  = le prix casse le dernier swing high en uptrend
+              (ou le dernier swing low en downtrend).
+    ─ CHoCH = le prix casse le dernier swing low en uptrend
+              (ou le dernier swing high en downtrend) → inversion.
+
+    On remonte uniquement les événements les plus récents.
+    """
+    if len(df) < (left + right + 4):
+        return {"bos": None, "choch": None, "swing_highs": [], "swing_lows": []}
+
     highs = df["high"].values
     lows  = df["low"].values
-    n = len(df)
-    bos, choch = None, None
+    n     = len(df)
 
-    for i in range(2, n - 1):
-        if highs[i] > max(highs[max(0,i-5):i]):
-            bos = f"BOS BULL @ {highs[i]:.5g}"
-        if lows[i] < min(lows[max(0,i-5):i]):
-            bos = f"BOS BEAR @ {lows[i]:.5g}"
-        if i > 5:
-            was_bull = highs[i-3] > highs[i-6]
-            now_bear = lows[i] < lows[i-3]
-            if was_bull and now_bear:
-                choch = f"CHoCH BEAR @ {lows[i]:.5g}"
-            was_bear = lows[i-3] < lows[i-6]
-            now_bull = highs[i] > highs[i-3]
-            if was_bear and now_bull:
-                choch = f"CHoCH BULL @ {highs[i]:.5g}"
+    sh_idx, sl_idx = _find_swings(highs, lows, left=left, right=right)
 
-    return {"bos": bos, "choch": choch}
+    if len(sh_idx) < 2 or len(sl_idx) < 2:
+        return {"bos": None, "choch": None,
+                "swing_highs": sh_idx, "swing_lows": sl_idx}
+
+    # ── Détermine la tendance structurelle via les 2 derniers swings de chaque type
+    last_sh  = sh_idx[-1];  prev_sh = sh_idx[-2]
+    last_sl  = sl_idx[-1];  prev_sl = sl_idx[-2]
+
+    trend_bull = (highs[last_sh] > highs[prev_sh]) and (lows[last_sl] > lows[prev_sl])
+    trend_bear = (highs[last_sh] < highs[prev_sh]) and (lows[last_sl] < lows[prev_sl])
+
+    last_close = df["close"].iloc[-1]
+    bos   = None
+    choch = None
+
+    # ── Prix actuel vs derniers swing points
+    if trend_bull:
+        # Tendance haussière
+        if last_close > highs[last_sh]:                 # casse le dernier SH → BOS bull
+            bos   = f"BOS BULL @ {highs[last_sh]:.5g}"
+        elif last_close < lows[last_sl]:                # casse le dernier SL → CHoCH bear
+            choch = f"CHoCH BEAR @ {lows[last_sl]:.5g}"
+
+    elif trend_bear:
+        # Tendance baissière
+        if last_close < lows[last_sl]:                  # casse le dernier SL → BOS bear
+            bos   = f"BOS BEAR @ {lows[last_sl]:.5g}"
+        elif last_close > highs[last_sh]:               # casse le dernier SH → CHoCH bull
+            choch = f"CHoCH BULL @ {highs[last_sh]:.5g}"
+
+    else:
+        # Structure mixte — on cherche l'événement le plus récent significatif
+        if last_close > highs[last_sh]:
+            bos   = f"BOS BULL @ {highs[last_sh]:.5g}"
+        elif last_close < lows[last_sl]:
+            bos   = f"BOS BEAR @ {lows[last_sl]:.5g}"
+
+    return {
+        "bos":          bos,
+        "choch":        choch,
+        "swing_highs":  sh_idx,   # indices — utilisables pour tracer sur le chart
+        "swing_lows":   sl_idx,
+        "trend":        "BULL" if trend_bull else "BEAR" if trend_bear else "MIXED",
+    }
 
 
 def detect_smc(df: pd.DataFrame) -> dict:
@@ -409,7 +482,8 @@ ZONE_STYLES = {
 
 
 def build_figure(df: pd.DataFrame, zones: dict, show: dict,
-                 symbol: str, signal: dict | None) -> go.Figure:
+                 symbol: str, signal: dict | None,
+                 struct: dict | None = None) -> go.Figure:
     fig = go.Figure()
     digits = MARKETS[symbol]["digits"]
 
@@ -422,6 +496,66 @@ def build_figure(df: pd.DataFrame, zones: dict, show: dict,
         decreasing_fillcolor=DARK["bear"], decreasing_line_color=DARK["bear"],
         whiskerwidth=0.3, showlegend=False,
     ))
+
+    # ── Swing points (BOS/CHoCH visuels) ──────────────────────────────────────
+    if struct:
+        sh_idx = struct.get("swing_highs", [])
+        sl_idx = struct.get("swing_lows",  [])
+        trend  = struct.get("trend", "MIXED")
+
+        # Couleur de la ligne de structure selon la tendance
+        struct_color = DARK["bull"] if trend == "BULL" else \
+                       DARK["bear"] if trend == "BEAR" else "#ffa03c"
+
+        # Markers sur les swing highs
+        if sh_idx:
+            valid = [i for i in sh_idx if i < len(df)]
+            fig.add_trace(go.Scatter(
+                x=[df["time"].iloc[i] for i in valid],
+                y=[df["high"].iloc[i] * 1.0003 for i in valid],
+                mode="markers+text",
+                marker=dict(symbol="triangle-down", size=8,
+                            color=DARK["bear"], line=dict(width=1, color=DARK["bear"])),
+                text=["SH"] * len(valid),
+                textposition="top center",
+                textfont=dict(size=7, color=DARK["bear"], family="Courier New"),
+                name="Swing High", showlegend=False, hoverinfo="skip",
+            ))
+
+        # Markers sur les swing lows
+        if sl_idx:
+            valid = [i for i in sl_idx if i < len(df)]
+            fig.add_trace(go.Scatter(
+                x=[df["time"].iloc[i] for i in valid],
+                y=[df["low"].iloc[i] * 0.9997 for i in valid],
+                mode="markers+text",
+                marker=dict(symbol="triangle-up", size=8,
+                            color=DARK["bull"], line=dict(width=1, color=DARK["bull"])),
+                text=["SL"] * len(valid),
+                textposition="bottom center",
+                textfont=dict(size=7, color=DARK["bull"], family="Courier New"),
+                name="Swing Low", showlegend=False, hoverinfo="skip",
+            ))
+
+        # Ligne de structure reliant les derniers swings (tendance visuelle)
+        last_points_x, last_points_y = [], []
+        if sh_idx and sl_idx:
+            # On relie les 3 derniers swing points dans l'ordre chronologique
+            pts = (
+                [(sh_idx[i], df["high"].iloc[sh_idx[i]]) for i in range(-3, 0) if sh_idx[i] < len(df)] +
+                [(sl_idx[i], df["low"].iloc[sl_idx[i]])  for i in range(-3, 0) if sl_idx[i] < len(df)]
+            )
+            pts.sort(key=lambda x: x[0])
+            last_points_x = [df["time"].iloc[p[0]] for p in pts]
+            last_points_y = [p[1] for p in pts]
+
+        if last_points_x:
+            fig.add_trace(go.Scatter(
+                x=last_points_x, y=last_points_y,
+                mode="lines",
+                line=dict(color=struct_color, width=1, dash="dot"),
+                name="Structure", showlegend=False, hoverinfo="skip",
+            ))
 
     for zone_key, style in ZONE_STYLES.items():
         if not show.get(zone_key, True):
@@ -480,9 +614,49 @@ def build_figure(df: pd.DataFrame, zones: dict, show: dict,
 
 # ─── CLAUDE AI ────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Tu es AlphaBot-AI, analyste SMC expert.
-Analyse concise et professionnelle en français.
-Pas de conseil financier — analyse technique objective uniquement."""
+SYSTEM_PROMPT = """Tu es AlphaBot-AI, analyste senior en trading institutionnel.
+Tu maîtrises le Smart Money Concept (SMC), l'analyse macro-fondamentale et le timing de marché.
+Tu as accès à la recherche web en temps réel.
+Tu raisonnes comme un trader de hedge fund : contexte d'abord, puis zones, puis timing, puis décision.
+Réponds TOUJOURS en français, de façon structurée, précise et professionnelle.
+Jamais de conseil financier — analyse technique et fondamentale objective uniquement."""
+
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+}
+
+
+def _get_market_phase(session: str, tf: str) -> str:
+    """Déduit la phase de marché probable selon session et timeframe."""
+    day = datetime.now(timezone.utc).weekday()  # 0=lundi … 4=vendredi
+    day_label = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"][day]
+    phase = "accumulation" if day in (0, 1) else \
+            "expansion"    if day in (2, 3) else \
+            "distribution" if day == 4 else "hors-semaine"
+    return f"{day_label} → phase probable : {phase}"
+
+
+def _get_correlations(symbol: str) -> str:
+    """Retourne le contexte de corrélation macro par actif."""
+    if symbol == "XAUUSD":
+        return (
+            "Corrélations Or :\n"
+            "  • USD fort     → Gold ↓ (inverse)\n"
+            "  • Taux élevés  → Gold ↓ (coût d'opportunité)\n"
+            "  • Risk-off     → Gold ↑ (valeur refuge)\n"
+            "  • Inflation ↑  → Gold ↑ (long terme)\n"
+            "  • Géopolitique → Gold ↑ (incertitude)"
+        )
+    else:
+        return (
+            "Corrélations Bitcoin :\n"
+            "  • Risk-off global → BTC ↓ (corrélé actions tech)\n"
+            "  • USD fort        → BTC ↓ (pression)\n"
+            "  • Liquidités Fed  → BTC ↑ (inflation asset)\n"
+            "  • ETF flows       → BTC ↑/↓ (demande institutionnelle)\n"
+            "  • Régulation      → BTC volatilité extrême"
+        )
 
 
 def analyse_claude(symbol: str, tf: str, trend: str, structure: dict,
@@ -493,58 +667,177 @@ def analyse_claude(symbol: str, tf: str, trend: str, structure: dict,
 
     def fmt(items, label):
         return "\n".join(
-            f"  {label} [{z['dir'].upper()}] : {z['low']:.{digits}f}–{z['high']:.{digits}f}"
-            for z in items[-2:]
+            f"  {label} [{z['dir'].upper()}] : {z['low']:.{digits}f} – {z['high']:.{digits}f}"
+            for z in items[-3:]
         ) if items else ""
 
     zones_txt = "\n".join(filter(None, [
-        fmt(zones.get("order_blocks",   []), "Order Block"),
-        fmt(zones.get("fvg",            []), "FVG"),
-        fmt(zones.get("breaker_blocks", []), "Breaker Block"),
-        fmt(zones.get("supply_demand",  []), "Supply/Demand"),
+        fmt(zones.get("order_blocks",   []), "Order Block   "),
+        fmt(zones.get("fvg",            []), "FVG           "),
+        fmt(zones.get("breaker_blocks", []), "Breaker Block "),
+        fmt(zones.get("supply_demand",  []), "Supply/Demand "),
     ])) or "  Aucune zone SMC détectée"
 
     sig_txt = (
-        f"\nSetup détecté : {signal['direction'].upper()} | "
+        f"✅ Setup ACTIF : {signal['direction'].upper()} | "
         f"Entry {signal['entry']:.{digits}f} | "
         f"SL {signal['sl']:.{digits}f} | "
         f"TP {signal['tp']:.{digits}f} | "
-        f"RR 1:{signal['rr']} | Score {signal['score']}"
-        if signal else "\nAucun setup SMC actif (score < 75 ou RR < 1:3)"
+        f"RR 1:{signal['rr']} | Score {signal['score']}/100"
+        if signal else "⛔ Aucun setup actif (score < 75 ou RR < 1:3)"
     )
 
-    prompt = f"""
-Symbole : {symbol} | TF : {tf} | Session : {session}
-Prix actuel (RÉEL) : {price:.{digits}f}
-Tendance H4 : {trend}
-Structure : BOS={structure.get('bos','—')} | CHoCH={structure.get('choch','—')}
+    # ── Structure SMC enrichie (swing points réels) ───────────────────────────
+    struct_trend = structure.get("trend", "MIXED")
+    struct_bos   = structure.get("bos",   "—")
+    struct_choch = structure.get("choch", "—")
+    sh_idx       = structure.get("swing_highs", [])
+    sl_idx       = structure.get("swing_lows",  [])
 
-=== ZONES SMC RÉELLES ===
+    # On affiche les 3 derniers indices — Claude comprend la séquence structurelle
+    sh_str = ", ".join(f"#{i}" for i in sh_idx[-3:]) if sh_idx else "—"
+    sl_str = ", ".join(f"#{i}" for i in sl_idx[-3:]) if sl_idx else "—"
+
+    struct_txt = (
+        f"Tendance structurelle : {struct_trend}\n"
+        f"  BOS   : {struct_bos}\n"
+        f"  CHoCH : {struct_choch}\n"
+        f"  Swing Highs récents (n° bougie) : {sh_str}\n"
+        f"  Swing Lows  récents (n° bougie) : {sl_str}\n"
+        f"  Séquence : {'HH/HL — uptrend structurel confirmé' if struct_trend == 'BULL' else 'LH/LL — downtrend structurel confirmé' if struct_trend == 'BEAR' else 'Structure mixte — pas de tendance claire, prudence'}"
+    )
+
+    symbol_name  = "Bitcoin (BTC/USD)" if symbol == "BTCUSD" else "Or (XAU/USD)"
+    search_hint  = "Bitcoin BTC price crypto news" if symbol == "BTCUSD" else "Gold XAU price commodities news"
+    now_str      = datetime.utcnow().strftime("%d %B %Y %H:%M UTC")
+    market_phase = _get_market_phase(session, tf)
+    correlations = _get_correlations(symbol)
+
+    # Jour de la semaine pour timing
+    day_num = datetime.now(timezone.utc).weekday()
+    is_month_end = datetime.now(timezone.utc).day >= 25
+
+    prompt = f"""Nous sommes le {now_str}. Mission : analyse institutionnelle complète pour {symbol_name}.
+
+══════════════════════════════════════════
+ DONNÉES DE MARCHÉ RÉELLES
+══════════════════════════════════════════
+Prix actuel   : {price:.{digits}f}
+Timeframe     : {tf}
+Session       : {session}
+Tendance prix : {trend}
+
+Structure de marché (SMC — swing points réels) :
+{struct_txt}
+
+Zones SMC détectées :
 {zones_txt}
-{sig_txt}
 
-Fournis une analyse structurée en 5 points :
-1. BIAS global (Bullish/Bearish/Neutre) + justification
-2. Zone d'attaque prioritaire (fourchette précise)
-3. Scénario de réaction du prix attendu
-4. Confirmation d'entrée à attendre (bougie, retest…)
-5. Risque principal / invalidation du setup
-Maximum 200 mots. Précis, professionnel.
-"""
+Signal algorithmique : {sig_txt}
+
+══════════════════════════════════════════
+ CONTEXTE MACRO À INTÉGRER
+══════════════════════════════════════════
+{correlations}
+
+Timing actuel :
+  • Phase hebdo   : {market_phase}
+  • Fin de mois   : {'OUI — volatilité accrue possible' if is_month_end else 'Non'}
+  • Session       : {session} ({'expansion probable' if session in ('LONDON','NEW YORK') else 'accumulation / faible liquidité'})
+
+══════════════════════════════════════════
+ MISSION EN 2 ÉTAPES
+══════════════════════════════════════════
+ÉTAPE 1 : Recherche web — trouve les NEWS DU JOUR impactant {search_hint}.
+  Cherche : décisions Fed, CPI/PPI, NFP, géopolitique, sentiment risk-on/off, ETF flows si BTC.
+  Pour chaque news : classe → Impact (Bullish/Bearish/Neutre) + Horizon (court/moyen) + Force (faible/modérée/forte).
+
+ÉTAPE 2 : Rédige l'analyse complète dans ce format EXACT :
+
+── FONDAMENTAL & NEWS
+• [News 1] → Impact : X | Force : X
+• [News 2] → Impact : X | Force : X
+• [News 3 si dispo] → Impact : X | Force : X
+• Sentiment macro : risk-on / risk-off / neutre
+• Catalyseur dominant du moment :
+
+── CONTEXTE DE MARCHÉ
+• Phase hebdo    : [accumulation / expansion / distribution]
+• Weekly context : [bullish / bearish / range]
+• Daily context  : [en trend / retracement / consolidation]
+• Session        : [type de mouvement attendu]
+
+── TECHNIQUE SMC
+• BIAS : BULLISH / BEARISH / NEUTRE
+• Zone d'attaque prioritaire : XXXX – XXXX
+• Expectation dans la zone   : [sweep + reversal / reaction directe / break + continuation]
+• Confirmation d'entrée      : [MSB / CHoCH / engulf M5 / autre]
+• Invalidation               : [niveau ou condition]
+
+── PROJECTION MARCHÉ
+• Chemin probable : [continue / retracement / range]
+• Cible court terme : XXXX
+• Cible moyen terme : XXXX
+• Scénario 1 (haute prob.) :
+    Conditions :
+    Résultat   :
+• Scénario 2 (alternatif) :
+    Conditions :
+    Résultat   :
+
+── TIMING
+• Session en cours    : {session}
+• Type de setup       : [liquidity grab / trend continuation / reversal]
+• Moment optimal      : [now / attendre London / attendre NY / éviter]
+• Fin de mois         : {'Attention — volatilité possible' if is_month_end else 'RAS'}
+
+── SCORE DU TRADE
+  Score global    : XX/100
+  Confiance       : LOW / MEDIUM / HIGH
+  TRADE VALIDE    : OUI ✅ / NON ❌
+  Raison          : [1 phrase]
+
+Sois précis sur les prix. Maximum 400 mots. Aucun conseil financier."""
+
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role":"user","content":prompt}],
-        )
-        return resp.content[0].text.strip()
+        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        messages = [{"role": "user", "content": prompt}]
+
+        # Boucle agentique — max 8 tours (recherches multiples possibles)
+        for _ in range(8):
+            resp = client.messages.create(
+                model        = "claude-sonnet-4-6",
+                max_tokens   = 2000,
+                system       = SYSTEM_PROMPT,
+                tools        = [WEB_SEARCH_TOOL],
+                messages     = messages,
+            )
+
+            if resp.stop_reason == "end_turn":
+                texts = [b.text for b in resp.content if b.type == "text"]
+                return "\n".join(texts).strip() or "Pas de réponse."
+
+            if resp.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": resp.content})
+                tool_results = [
+                    {"type": "tool_result", "tool_use_id": b.id, "content": ""}
+                    for b in resp.content if b.type == "tool_use"
+                ]
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+                continue
+
+            texts = [b.text for b in resp.content if hasattr(b, "text")]
+            return "\n".join(texts).strip() or "Analyse terminée."
+
+        return "⏳ Analyse interrompue après plusieurs recherches."
+
     except anthropic.AuthenticationError:
-        return "❌ Clé API Anthropic invalide."
+        return "❌ Clé API Anthropic invalide — vérifie ANTHROPIC_API_KEY dans Render."
     except anthropic.RateLimitError:
         return "⏳ Rate limit Anthropic — réessaie dans quelques secondes."
     except Exception as e:
+        log.error(f"analyse_claude error: {e}")
         return f"❌ Erreur Claude : {e}"
 
 
@@ -682,7 +975,7 @@ app.layout = html.Div([
             }),
 
             html.Div([
-                html.Button("🧠  ANALYSE CLAUDE AI", id="btn-ia", n_clicks=0, style={
+                html.Button("🧠  ANALYSE IA — TECH + NEWS", id="btn-ia", n_clicks=0, style={
                     "width":"100%","padding":"11px","borderRadius":5,"cursor":"pointer",
                     "border":f"1px solid {DARK['accent']}",
                     "background":"linear-gradient(135deg,rgba(0,212,170,0.18),rgba(0,119,255,0.18))",
@@ -916,7 +1209,7 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     df  = pd.read_json(StringIO(candles_json), orient="records")
     show= {"order_blocks":bool(tog_ob),"fvg":bool(tog_fvg),
            "breaker_blocks":bool(tog_bb),"supply_demand":bool(tog_sd)}
-    fig = build_figure(df, zones, show, symbol, signal)
+    fig = build_figure(df, zones, show, symbol, signal, struct=struct)
     digits = MARKETS[symbol]["digits"]
 
     tc = DARK["bull"] if trend=="BULLISH" else DARK["bear"] if trend=="BEARISH" else "#ffa03c"
@@ -924,9 +1217,12 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     trend_style = {"fontWeight":"bold","letterSpacing":1,"color":tc,"fontSize":10}
 
     s_parts = []
-    if struct.get("bos"):   s_parts.append(struct["bos"])
-    if struct.get("choch"): s_parts.append(struct["choch"])
-    struct_txt = "  |  ".join(s_parts) if s_parts else "Structure : —"
+    if struct and struct.get("trend"):
+        trend_map = {"BULL": "↗ BULL STRUCT", "BEAR": "↘ BEAR STRUCT", "MIXED": "↔ MIXED"}
+        s_parts.append(trend_map.get(struct["trend"], ""))
+    if struct and struct.get("bos"):   s_parts.append(struct["bos"])
+    if struct and struct.get("choch"): s_parts.append(struct["choch"])
+    struct_txt = "  |  ".join(filter(None, s_parts)) if s_parts else "Structure : —"
 
     if signal:
         sc = DARK["bull"] if signal["direction"]=="bull" else DARK["bear"]
@@ -987,9 +1283,12 @@ def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
     r  = analyse_claude(symbol, tf, trend, struct or {}, zones or {},
                         p, get_session(), signal, m["digits"])
     return html.Div([
-        html.Div(f"▸ {symbol} {tf} — {get_session()} — {datetime.utcnow().strftime('%H:%M UTC')}",
-                 style={"color":DARK["accent"],"letterSpacing":2,"marginBottom":10,
-                        "fontSize":9,"borderBottom":f"1px solid {DARK['border']}","paddingBottom":5}),
+        html.Div([
+            html.Span(f"▸ {symbol} {tf}", style={"color":DARK["accent"],"fontWeight":"bold"}),
+            html.Span(f"  |  {get_session()}  |  {datetime.utcnow().strftime('%H:%M UTC')}  |  🌐 NEWS LIVE",
+                      style={"color":DARK["text"]}),
+        ], style={"display":"flex","alignItems":"center","marginBottom":10,
+                  "fontSize":9,"borderBottom":f"1px solid {DARK['border']}","paddingBottom":5}),
         html.Div(r, style={"whiteSpace":"pre-wrap","lineHeight":"1.9"}),
     ])
 
@@ -1038,5 +1337,23 @@ if __name__ == "__main__":
     print("  GOLD : yfinance GC=F + metals.live (gratuit)")
     print("=" * 55)
 
+    # Message Telegram de démarrage
+    startup_msg = (
+        "\U0001f7e2 *AlphaBot SMC PRO \u2014 EN LIGNE*\n"
+        f"\u23f0 {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "\u2705 BTC  \u2192 Binance API\n"
+        "\u2705 GOLD \u2192 yfinance + metals.live\n"
+        "\u2705 Dashboard accessible\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "En attente de signaux SMC (score \u2265 75, RR \u2265 1:3)\u2026"
+    )
+    ok = send_telegram(startup_msg)
+    if ok:
+        log.info("Message de démarrage Telegram envoyé")
+    else:
+        log.warning("Message de démarrage Telegram non envoyé — vérifie TOKEN/CHAT_ID")
+
     port = int(os.environ.get("PORT", 8050))
     app.run(debug=False, host="0.0.0.0", port=port)
+
