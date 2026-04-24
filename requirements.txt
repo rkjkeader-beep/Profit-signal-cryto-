@@ -1,4 +1,8 @@
-main.py
+pandas
+numpy
+requests
+flask
+python-telegram-bot
 config.py
 signal_manager.py
 session_manager.py
@@ -10,13 +14,3 @@ anthropic
 pandas
 numpy
 requests
-# AlphaBot SMC PRO — dépendances LIVE
-dash>=2.17
-plotly>=5.22
-anthropic>=0.25
-pandas>=2.0
-numpy>=1.26
-requests>=2.31
-
-# Pour XAUUSD / Forex via MetaTrader 5 (Windows uniquement) :
-# MetaTrader5>=5.0.45
