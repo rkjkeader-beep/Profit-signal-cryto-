@@ -2,8 +2,6 @@
 pandas
 numpy
 requests
-flask
-python-telegram-bot
-config.py
 anthropic
 plotly
+dash
