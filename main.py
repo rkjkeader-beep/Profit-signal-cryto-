@@ -1,18 +1,26 @@
 
+
 """
-dashboard_live.py — AlphaBot SMC PRO (LIVE)
+main.py — AlphaBot SMC PRO (LIVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Sources réelles :
   • BTCUSD  → Binance REST API  (gratuit, sans compte)
-  • XAUUSD  → MetaTrader 5      (broker connecté requis)
+  • XAUUSD  → yfinance GC=F    (gratuit, sans compte)
+               + metals.live   (prix live spot)
 
-Lancement :
-  pip install -r requirements_live.txt
-  export ANTHROPIC_API_KEY=sk-ant-...
-  export TELEGRAM_TOKEN=...          (optionnel)
-  export TELEGRAM_CHAT_ID=...        (optionnel)
-  python dashboard_live.py
-  → http://localhost:8050
+requirements.txt :
+  pandas
+  numpy
+  requests
+  anthropic
+  plotly
+  dash
+  yfinance
+
+Variables d'environnement Render :
+  ANTHROPIC_API_KEY
+  TELEGRAM_TOKEN
+  TELEGRAM_CHAT_ID
 """
 
 import os
@@ -24,16 +32,10 @@ from datetime import datetime, timezone
 import anthropic
 import pandas as pd
 import requests
+import yfinance as yf
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
-
-# MT5 optionnel — si non installé, XAUUSD sera désactivé
-try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
-except ImportError:
-    MT5_AVAILABLE = False
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -43,21 +45,21 @@ logging.basicConfig(
 log = logging.getLogger("alphabot")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8666812395")
 
 MARKETS = {
-    "BTCUSD":  {"source": "binance", "binance_sym": "BTCUSDT", "digits": 1,  "pip": 1,     "spread_max": 5},
-    "XAUUSD":  {"source": "mt5",     "mt5_sym":     "XAUUSD",  "digits": 2,  "pip": 0.1,   "spread_max": 0.3},
+    "BTCUSD": {"source": "binance",  "binance_sym": "BTCUSDT", "digits": 1, "pip": 1,   "spread_max": 5},
+    "XAUUSD": {"source": "yfinance", "yf_sym":      "GC=F",    "digits": 2, "pip": 0.1, "spread_max": 0.5},
 }
 
-TF_BINANCE = {"M1":"1m","M5":"5m","M15":"15m","H1":"1h","H4":"4h"}
-TF_MT5     = {"M1": 1,  "M5": 5,  "M15": 15,  "H1": 60, "H4": 240}
-TIMEFRAMES  = ["M1","M5","M15","H1","H4"]
+TF_BINANCE  = {"M1":"1m","M5":"5m","M15":"15m","H1":"1h","H4":"4h"}
+TF_YFINANCE = {"M1":"1m","M5":"5m","M15":"15m","H1":"1h","H4":"1h"}   # yfinance max intraday
+TIMEFRAMES   = ["M1","M5","M15","H1","H4"]
 CANDLE_COUNT = 120
-REFRESH_INTERVAL_MS = 30_000   # 30s — bougies complètes
-TICK_INTERVAL_MS    =  2_000   # 2s  — prix live
+REFRESH_INTERVAL_MS = 30_000   # 30s
+TICK_INTERVAL_MS    =  5_000   # 5s  (metals.live rate-limit friendly)
 
 DARK = {
     "bg":     "#0a0b0e", "panel":  "#0f1117",
@@ -69,10 +71,10 @@ DARK = {
 MIN_SCORE = 75
 MIN_RR    = 3.0
 
+
 # ─── DONNÉES BINANCE ──────────────────────────────────────────────────────────
 
 def get_binance_candles(symbol: str, tf: str, limit: int = CANDLE_COUNT) -> pd.DataFrame | None:
-    """Bougies réelles depuis l'API publique Binance (aucune clé requise)."""
     interval = TF_BINANCE.get(tf, "15m")
     url = "https://api.binance.com/api/v3/klines"
     try:
@@ -83,7 +85,7 @@ def get_binance_candles(symbol: str, tf: str, limit: int = CANDLE_COUNT) -> pd.D
             "time","open","high","low","close","volume",
             "close_time","qav","trades","tbbav","tbqav","ignore",
         ])
-        df["time"]  = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         return df[["time","open","high","low","close","volume"]]
@@ -93,7 +95,6 @@ def get_binance_candles(symbol: str, tf: str, limit: int = CANDLE_COUNT) -> pd.D
 
 
 def get_binance_price(symbol: str) -> float | None:
-    """Prix actuel Binance."""
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/ticker/price",
@@ -105,49 +106,70 @@ def get_binance_price(symbol: str) -> float | None:
         return None
 
 
-# ─── DONNÉES MT5 ──────────────────────────────────────────────────────────────
+# ─── DONNÉES GOLD via yfinance + metals.live ──────────────────────────────────
 
-_mt5_initialized = False
+def get_yfinance_candles(symbol: str, tf: str, count: int = CANDLE_COUNT) -> pd.DataFrame | None:
+    """Bougies Gold depuis Yahoo Finance (GC=F — Gold Futures). Gratuit, sans clé."""
+    interval = TF_YFINANCE.get(tf, "15m")
+    # H4 non dispo nativement — on utilise H1 et on resamble
+    resample_h4 = (tf == "H4")
+    fetch_interval = "1h" if resample_h4 else interval
 
-def _ensure_mt5() -> bool:
-    global _mt5_initialized
-    if not MT5_AVAILABLE:
-        return False
-    if _mt5_initialized:
-        return True
-    if mt5.initialize():
-        _mt5_initialized = True
-        log.info(f"MT5 connecté : {mt5.terminal_info().name}")
-        return True
-    log.error(f"MT5 init échoué : {mt5.last_error()}")
-    return False
+    # Période : intraday limité à 60 jours max pour yfinance
+    period_map = {"1m":"1d","5m":"5d","15m":"60d","1h":"60d"}
+    period = period_map.get(fetch_interval, "60d")
 
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=fetch_interval, auto_adjust=True)
+        if df is None or df.empty:
+            log.error(f"yfinance: données vides pour {symbol} {tf}")
+            return None
 
-def get_mt5_candles(symbol: str, tf: str, count: int = CANDLE_COUNT) -> pd.DataFrame | None:
-    """Bougies réelles depuis MetaTrader 5."""
-    if not _ensure_mt5():
+        df = df.reset_index()
+        df = df.rename(columns={
+            "Datetime": "time", "Date": "time",
+            "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
+        })
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df = df[["time","open","high","low","close","volume"]].dropna()
+
+        # Resamble H1 → H4
+        if resample_h4:
+            df = df.set_index("time")
+            df = df.resample("4h").agg({
+                "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+            }).dropna().reset_index()
+
+        return df.tail(count).reset_index(drop=True)
+
+    except Exception as e:
+        log.error(f"yfinance candles error: {e}")
         return None
-    tf_map = {
-        "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
-        "M15":mt5.TIMEFRAME_M15,"H1": mt5.TIMEFRAME_H1,
-        "H4": mt5.TIMEFRAME_H4,
-    }
-    rates = mt5.copy_rates_from_pos(symbol, tf_map[tf], 0, count)
-    if rates is None or len(rates) == 0:
-        log.error(f"MT5 rates vides pour {symbol} {tf}: {mt5.last_error()}")
-        return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df.rename(columns={"tick_volume":"volume"})[["time","open","high","low","close","volume"]]
-    return df
 
 
-def get_mt5_price(symbol: str) -> float | None:
-    """Prix bid actuel MT5."""
-    if not _ensure_mt5():
-        return None
-    tick = mt5.symbol_info_tick(symbol)
-    return float(tick.bid) if tick else None
+def get_gold_price_live() -> float | None:
+    """Prix spot Gold live depuis metals.live — gratuit, sans clé."""
+    try:
+        r = requests.get("https://metals.live/api/spot", timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        for item in data:
+            if item.get("metal","").lower() == "gold":
+                return float(item["price"])
+    except Exception as e:
+        log.error(f"metals.live error: {e}")
+
+    # Fallback : dernier close yfinance si metals.live échoue
+    try:
+        ticker = yf.Ticker("GC=F")
+        hist = ticker.history(period="1d", interval="1m")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception as e:
+        log.error(f"yfinance price fallback error: {e}")
+
+    return None
 
 
 # ─── DISPATCHER ───────────────────────────────────────────────────────────────
@@ -156,8 +178,8 @@ def get_candles(symbol: str, tf: str) -> pd.DataFrame | None:
     cfg = MARKETS[symbol]
     if cfg["source"] == "binance":
         return get_binance_candles(cfg["binance_sym"], tf)
-    elif cfg["source"] == "mt5":
-        return get_mt5_candles(cfg["mt5_sym"], tf)
+    elif cfg["source"] == "yfinance":
+        return get_yfinance_candles(cfg["yf_sym"], tf)
     return None
 
 
@@ -165,8 +187,8 @@ def get_price(symbol: str) -> float | None:
     cfg = MARKETS[symbol]
     if cfg["source"] == "binance":
         return get_binance_price(cfg["binance_sym"])
-    elif cfg["source"] == "mt5":
-        return get_mt5_price(cfg["mt5_sym"])
+    elif cfg["source"] == "yfinance":
+        return get_gold_price_live()
     return None
 
 
@@ -190,13 +212,10 @@ def detect_bos_choch(df: pd.DataFrame) -> dict:
     bos, choch = None, None
 
     for i in range(2, n - 1):
-        # BOS haussier : cassure au-dessus du plus haut précédent
         if highs[i] > max(highs[max(0,i-5):i]):
             bos = f"BOS BULL @ {highs[i]:.5g}"
-        # BOS baissier
         if lows[i] < min(lows[max(0,i-5):i]):
             bos = f"BOS BEAR @ {lows[i]:.5g}"
-        # CHoCH : inversion de structure
         if i > 5:
             was_bull = highs[i-3] > highs[i-6]
             now_bear = lows[i] < lows[i-3]
@@ -220,17 +239,17 @@ def detect_smc(df: pd.DataFrame) -> dict:
     n = len(df)
 
     for i in range(3, n - 2):
-        body     = abs(c[i] - o[i])
-        n_bull   = c[i+1] - o[i+1]
-        n_bear   = o[i+1] - c[i+1]
+        body   = abs(c[i] - o[i])
+        n_bull = c[i+1] - o[i+1]
+        n_bear = o[i+1] - c[i+1]
 
-        # ── Order Blocks ──────────────────────────────────────────────
+        # Order Blocks
         if c[i] < o[i] and n_bull > body * 1.4:
             ob.append({"low": l[i], "high": h[i], "dir":"bull", "t0": t[i], "t1": t[-1]})
         if c[i] > o[i] and n_bear > body * 1.4:
             ob.append({"low": l[i], "high": h[i], "dir":"bear", "t0": t[i], "t1": t[-1]})
 
-        # ── Fair Value Gaps ───────────────────────────────────────────
+        # Fair Value Gaps
         gap_bull = l[i+1] - h[i-1]
         gap_bear = l[i-1] - h[i+1]
         if gap_bull > 0:
@@ -238,7 +257,7 @@ def detect_smc(df: pd.DataFrame) -> dict:
         if gap_bear > 0:
             fvg.append({"low": h[i+1], "high": l[i-1], "dir":"bear", "t0": t[i-1], "t1": t[-1]})
 
-        # ── Breaker Blocks ────────────────────────────────────────────
+        # Breaker Blocks
         if i > 5:
             j = i - 4
             if c[j] < o[j] and c[i] > h[j]:
@@ -246,7 +265,7 @@ def detect_smc(df: pd.DataFrame) -> dict:
             if c[j] > o[j] and c[i] < l[j]:
                 bb.append({"low": l[j], "high": h[j], "dir":"bear", "t0": t[j], "t1": t[-1]})
 
-        # ── Supply & Demand ───────────────────────────────────────────
+        # Supply & Demand
         if i > 2 and i < n - 3:
             consol = abs(h[i-1] - l[i-2]) < abs(h[i] - l[i]) * 0.5
             if consol and c[i] > o[i]:
@@ -265,7 +284,6 @@ def detect_smc(df: pd.DataFrame) -> dict:
 
 
 def score_signal(df: pd.DataFrame, zones: dict, trend: str) -> dict | None:
-    """Calcule un score SMC et un setup d'entrée potentiel."""
     if len(df) < 10:
         return None
 
@@ -276,7 +294,6 @@ def score_signal(df: pd.DataFrame, zones: dict, trend: str) -> dict | None:
     tp    = None
     direction = None
 
-    # Cherche l'OB le plus proche du prix actuel
     for z in reversed(zones.get("order_blocks", [])):
         in_zone = z["low"] <= last <= z["high"]
         aligned = (z["dir"]=="bull" and trend=="BULLISH") or (z["dir"]=="bear" and trend=="BEARISH")
@@ -299,22 +316,18 @@ def score_signal(df: pd.DataFrame, zones: dict, trend: str) -> dict | None:
                 tp = last - (sl - last) * MIN_RR
             break
 
-    # FVG confluence
     for z in zones.get("fvg", []):
         if z["low"] <= last <= z["high"]:
             score += 15
 
-    # Breaker confluence
     for z in zones.get("breaker_blocks", []):
         if z["low"] <= last <= z["high"]:
             score += 10
 
-    # S&D confluence
     for z in zones.get("supply_demand", []):
         if z["low"] <= last <= z["high"]:
             score += 10
 
-    # Session bonus
     sess = get_session()
     if sess in ("LONDON","NEW YORK"):
         score += 15
@@ -376,14 +389,10 @@ def format_signal(symbol: str, sig: dict, session: str, digits: int) -> str:
 # ─── GRAPHIQUE ────────────────────────────────────────────────────────────────
 
 ZONE_STYLES = {
-    "order_blocks":   {"bull":("rgba(0,200,150,0.15)",DARK["bull"]),
-                       "bear":("rgba(255,77,109,0.15)",DARK["bear"]),   "label":"OB"},
-    "fvg":            {"bull":("rgba(100,180,255,0.12)","#64b4ff"),
-                       "bear":("rgba(255,160,60,0.12)","#ffa03c"),      "label":"FVG"},
-    "breaker_blocks": {"bull":("rgba(200,100,255,0.15)","#c864ff"),
-                       "bear":("rgba(200,100,255,0.15)","#c864ff"),     "label":"BB"},
-    "supply_demand":  {"bull":("rgba(0,255,200,0.08)","#00ffc8"),
-                       "bear":("rgba(255,80,80,0.08)","#ff5050"),       "label":"S/D"},
+    "order_blocks":   {"bull":("rgba(0,200,150,0.15)",  DARK["bull"]), "bear":("rgba(255,77,109,0.15)",  DARK["bear"]), "label":"OB"},
+    "fvg":            {"bull":("rgba(100,180,255,0.12)","#64b4ff"),    "bear":("rgba(255,160,60,0.12)",  "#ffa03c"),    "label":"FVG"},
+    "breaker_blocks": {"bull":("rgba(200,100,255,0.15)","#c864ff"),    "bear":("rgba(200,100,255,0.15)", "#c864ff"),    "label":"BB"},
+    "supply_demand":  {"bull":("rgba(0,255,200,0.08)",  "#00ffc8"),    "bear":("rgba(255,80,80,0.08)",   "#ff5050"),    "label":"S/D"},
 }
 
 
@@ -422,7 +431,6 @@ def build_figure(df: pd.DataFrame, zones: dict, show: dict,
                 bgcolor="rgba(10,11,14,0.75)",
             )
 
-    # Signal d'entrée
     if signal:
         color = DARK["bull"] if signal["direction"]=="bull" else DARK["bear"]
         for price, label, dash in [
@@ -435,7 +443,6 @@ def build_figure(df: pd.DataFrame, zones: dict, show: dict,
                           annotation_position="right",
                           annotation_font=dict(size=9, color=color, family="Courier New"))
 
-    # Prix actuel
     last = df["close"].iloc[-1]
     lc   = DARK["bull"] if df["close"].iloc[-1] >= df["open"].iloc[-1] else DARK["bear"]
     fig.add_hline(y=last, line_dash="dot", line_color=lc, line_width=1,
@@ -470,7 +477,7 @@ def analyse_claude(symbol: str, tf: str, trend: str, structure: dict,
                    zones: dict, price: float, session: str,
                    signal: dict | None, digits: int) -> str:
     if not ANTHROPIC_API_KEY:
-        return "❌ ANTHROPIC_API_KEY non défini."
+        return "❌ ANTHROPIC_API_KEY non défini dans les variables d'environnement Render."
 
     def fmt(items, label):
         return "\n".join(
@@ -537,17 +544,15 @@ app = Dash(__name__, title="AlphaBot SMC LIVE")
 def sym_btn(sym, selected):
     active = sym == selected
     cfg    = MARKETS[sym]
-    unavail= (cfg["source"]=="mt5" and not MT5_AVAILABLE)
+    src_label = " YF" if cfg["source"]=="yfinance" else " BNC"
     return html.Button(
-        [sym, html.Span(" MT5" if cfg["source"]=="mt5" else " BNC",
-                        style={"fontSize":8,"opacity":0.6,"marginLeft":3})],
+        [sym, html.Span(src_label, style={"fontSize":8,"opacity":0.6,"marginLeft":3})],
         id={"type":"sym-btn","index":sym}, n_clicks=0,
-        disabled=unavail,
         style={
-            "padding":"4px 11px","borderRadius":4,"cursor":"pointer" if not unavail else "not-allowed",
+            "padding":"4px 11px","borderRadius":4,"cursor":"pointer",
             "border":f"1px solid {DARK['accent'] if active else DARK['border']}",
             "background":"rgba(0,212,170,0.13)" if active else "transparent",
-            "color": DARK["accent"] if active else (DARK["text"] if not unavail else "#333"),
+            "color": DARK["accent"] if active else DARK["text"],
             "fontFamily":"Courier New,monospace","fontSize":11,
         },
     )
@@ -627,14 +632,13 @@ app.layout = html.Div([
 
         # Chart column
         html.Div([
-            # Zone toggles
             html.Div([
                 html.Span("ZONES:", style={"fontSize":10,"color":DARK["text"],"marginRight":8}),
                 zone_toggle("order_blocks","Order Block",DARK["bull"]),
                 zone_toggle("fvg","FVG","#64b4ff"),
                 zone_toggle("breaker_blocks","Breaker Block","#c864ff"),
                 zone_toggle("supply_demand","Supply/Demand","#00ffc8"),
-                html.Button("↻ FORCER REFRESH", id="btn-refresh", n_clicks=0, style={
+                html.Button("↻ REFRESH", id="btn-refresh", n_clicks=0, style={
                     "marginLeft":"auto","padding":"3px 12px","borderRadius":3,
                     "border":f"1px solid {DARK['border']}","background":"transparent",
                     "color":DARK["text"],"cursor":"pointer","fontSize":10,
@@ -643,7 +647,6 @@ app.layout = html.Div([
             ], style={"display":"flex","alignItems":"center","padding":"7px 14px",
                       "borderBottom":f"1px solid {DARK['border']}","flexShrink":0}),
 
-            # Trend + structure
             html.Div([
                 html.Span("TREND H4:", style={"color":DARK["text"],"fontSize":10}),
                 html.Span(id="trend-lbl",style={"fontWeight":"bold","fontSize":10}),
@@ -652,7 +655,6 @@ app.layout = html.Div([
             ], style={"display":"flex","alignItems":"center","gap":10,"padding":"5px 14px",
                       "borderBottom":f"1px solid {DARK['border']}","flexShrink":0}),
 
-            # Candle chart
             dcc.Graph(id="chart", config={"scrollZoom":True,"displayModeBar":True,
                       "modeBarButtonsToRemove":["autoScale2d","lasso2d","select2d"]},
                       style={"flex":1,"minHeight":0}),
@@ -661,13 +663,11 @@ app.layout = html.Div([
 
         # Right panel
         html.Div([
-            # Zones list
             html.Div(id="zones-list", style={
                 "padding":"12px 14px","borderBottom":f"1px solid {DARK['border']}",
                 "fontSize":10,"lineHeight":"1.9","maxHeight":230,"overflowY":"auto",
             }),
 
-            # Analyse button
             html.Div([
                 html.Button("🧠  ANALYSE CLAUDE AI", id="btn-ia", n_clicks=0, style={
                     "width":"100%","padding":"11px","borderRadius":5,"cursor":"pointer",
@@ -678,7 +678,6 @@ app.layout = html.Div([
                 }),
             ], style={"padding":"10px 14px","borderBottom":f"1px solid {DARK['border']}"}),
 
-            # Analysis output
             dcc.Loading(type="circle", color=DARK["accent"], children=
                 html.Div(id="ia-output", style={
                     "flex":1,"padding":"12px 14px","overflowY":"auto",
@@ -687,7 +686,6 @@ app.layout = html.Div([
                 }),
             ),
 
-            # Alerts log
             html.Div([
                 html.Div("▸ SIGNAUX DÉTECTÉS", style={"color":DARK["accent"],"fontSize":9,
                          "letterSpacing":2,"marginBottom":6}),
@@ -728,7 +726,6 @@ def cb_tf(*_):
     return ctx.triggered[0]["prop_id"].split('"index":"')[1].split('"')[0]
 
 
-# Chargement réel des bougies (toutes les 30s ou sur changement sym/tf)
 @app.callback(
     Output("s-candles","data"),
     Output("s-zones",  "data"),
@@ -752,7 +749,6 @@ def cb_load_candles(symbol, tf, _iv, _btn):
     struct  = detect_bos_choch(df)
     signal  = score_signal(df, zones, trend)
 
-    # Alerte Telegram si signal valide
     if signal:
         sess = get_session()
         msg  = format_signal(symbol, signal, sess, MARKETS[symbol]["digits"])
@@ -767,7 +763,6 @@ def cb_load_candles(symbol, tf, _iv, _btn):
     )
 
 
-# Prix live (toutes les 2s)
 @app.callback(
     Output("s-price",   "data"),
     Output("live-price","children"),
@@ -796,7 +791,6 @@ def cb_tick(_, symbol, prev_price):
     return price, widget
 
 
-# Session + source badges
 @app.callback(
     Output("session-badge","children"),
     Output("source-badge", "children"),
@@ -821,7 +815,6 @@ def cb_badges(_, symbol):
     return sess_badge, src_badge
 
 
-# Chart update
 @app.callback(
     Output("chart",      "figure"),
     Output("trend-lbl",  "children"),
@@ -855,18 +848,15 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     fig = build_figure(df, zones, show, symbol, signal)
     digits = MARKETS[symbol]["digits"]
 
-    # Trend label
     tc = DARK["bull"] if trend=="BULLISH" else DARK["bear"] if trend=="BEARISH" else "#ffa03c"
     ta = "▲" if trend=="BULLISH" else "▼" if trend=="BEARISH" else "→"
     trend_style = {"fontWeight":"bold","letterSpacing":1,"color":tc,"fontSize":10}
 
-    # Structure label
     s_parts = []
     if struct.get("bos"):   s_parts.append(struct["bos"])
     if struct.get("choch"): s_parts.append(struct["choch"])
     struct_txt = "  |  ".join(s_parts) if s_parts else "Structure : —"
 
-    # Signal label
     if signal:
         sc = DARK["bull"] if signal["direction"]=="bull" else DARK["bear"]
         sig_txt  = f"✅ SETUP {signal['direction'].upper()} | Score {signal['score']} | RR 1:{signal['rr']}"
@@ -875,7 +865,6 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
         sig_txt  = "Pas de setup actif"
         sig_style = {"color":DARK["text"],"fontSize":10}
 
-    # Zones list
     rows = [html.Div("▸ ZONES ACTIVES",style={
         "color":DARK["accent"],"letterSpacing":2,"marginBottom":7,
         "fontSize":9,"borderBottom":f"1px solid {DARK['border']}","paddingBottom":5,
@@ -899,14 +888,12 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     if len(rows) == 1:
         rows.append(html.Div("Aucune zone détectée",style={"color":DARK["text"]}))
 
-    # Alerts log
     alert_rows = [html.Div(a) for a in (alerts or [])[-8:]] or \
                  [html.Div("Aucun signal depuis le lancement",style={"color":DARK["border"]})]
 
     return fig, f"{ta} {trend}", trend_style, struct_txt, sig_txt, sig_style, rows, alert_rows
 
 
-# Claude AI
 @app.callback(
     Output("ia-output","children"),
     Input("btn-ia","n_clicks"),
@@ -939,17 +926,16 @@ def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if not MT5_AVAILABLE:
-        log.warning("MetaTrader5 non installé — XAUUSD désactivé (pip install MetaTrader5)")
     if not ANTHROPIC_API_KEY:
-        log.warning("ANTHROPIC_API_KEY manquant — bouton /ia désactivé")
+        log.warning("ANTHROPIC_API_KEY manquant — bouton Claude AI désactivé")
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN manquant — alertes Telegram désactivées")
 
     print("=" * 55)
     print("  AlphaBot SMC PRO — LIVE RÉEL")
-    print("  BTC  : Binance API (aucune clé requise)")
-    print("  GOLD : MetaTrader 5 (broker requis)")
-    print("  http://localhost:8050")
+    print("  BTC  : Binance API  (gratuit, sans compte)")
+    print("  GOLD : yfinance GC=F + metals.live (gratuit)")
     print("=" * 55)
-    app.run(debug=False, host="0.0.0.0", port=8050)
+
+    port = int(os.environ.get("PORT", 8050))
+    app.run(debug=False, host="0.0.0.0", port=port)
