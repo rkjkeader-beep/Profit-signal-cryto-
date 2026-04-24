@@ -1,3 +1,5 @@
-
-requirements.txt  
-python main.py                    
+python-telegram-bot
+anthropic
+pandas
+numpy
+requests
