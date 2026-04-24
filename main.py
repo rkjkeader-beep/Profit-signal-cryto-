@@ -1,5 +1,6 @@
 
 
+
 """
 main.py — AlphaBot SMC PRO (LIVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -27,6 +28,8 @@ import os
 import logging
 import threading
 import time
+import json
+from io import StringIO
 from datetime import datetime, timezone
 
 import anthropic
@@ -910,7 +913,7 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
     if not candles_json or not zones:
         raise PreventUpdate
 
-    df  = pd.read_json(candles_json, orient="records")
+    df  = pd.read_json(StringIO(candles_json), orient="records")
     show= {"order_blocks":bool(tog_ob),"fvg":bool(tog_fvg),
            "breaker_blocks":bool(tog_bb),"supply_demand":bool(tog_sd)}
     fig = build_figure(df, zones, show, symbol, signal)
@@ -978,7 +981,7 @@ def cb_chart(candles_json, zones, trend, struct, signal, alerts,
 def cb_ia(n, candles_json, zones, trend, struct, signal, price, symbol, tf):
     if not n or not candles_json:
         raise PreventUpdate
-    df = pd.read_json(candles_json, orient="records")
+    df = pd.read_json(StringIO(candles_json), orient="records")
     p  = price or df["close"].iloc[-1]
     m  = MARKETS[symbol]
     r  = analyse_claude(symbol, tf, trend, struct or {}, zones or {},
@@ -1037,4 +1040,3 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8050))
     app.run(debug=False, host="0.0.0.0", port=port)
-
