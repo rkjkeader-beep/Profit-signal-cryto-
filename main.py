@@ -51,6 +51,7 @@ except ImportError:
 DEFAULT_SYMBOL  = "GBPUSD=X"
 HTF             = "1h"     # Biais directionnel
 MTF             = "15m"    # Confirmation structure (BOS + OB)
+MTF2            = "30m"    # FVG intermédiaire (équivalent 45min — yfinance ne supporte pas 45m)
 LTF             = "5m"     # Entrée précise (FVG + bougie confirmation)
 ENTRY_TF        = "1m"     # Trigger final optionnel (confirmation M1)
 
@@ -167,16 +168,6 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
 def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> None:
     """Envoie la notification Telegram au DM personnel ET au groupe."""
     global TELEGRAM_CHAT_ID, TELEGRAM_GROUP_ID, _signal_cache
-
-    # ── Anti-spam cooldown ────────────────────────────────────
-    cache_key = f"{sig.symbol}:{sig.direction}"
-    now = time.time()
-    last_sent = _signal_cache.get(cache_key, 0)
-    if now - last_sent < SIGNAL_COOLDOWN:
-        remaining = int(SIGNAL_COOLDOWN - (now - last_sent))
-        print(c(f"  [TG] ⏳ Signal déjà envoyé — cooldown {remaining}s restant", "yellow"))
-        return
-    _signal_cache[cache_key] = now
 
     # ── Résolution chat_id personnel ──────────────────────────
     cid = chat_id or TELEGRAM_CHAT_ID
@@ -324,45 +315,57 @@ def compute_lot(symbol: str, entry: float, sl: float,
     return lot
 
 
-def fetch(symbol: str, interval: str, period: str = "5d") -> pd.DataFrame:
+def fetch(symbol: str, interval: str, period: str = "5d",
+          retries: int = 3, retry_delay: int = 15) -> pd.DataFrame:
     """
-    Télécharge les OHLCV via yfinance.
+    Télécharge les OHLCV via yfinance avec retry automatique.
 
     CORRECTIF yfinance >= 0.2.x :
-    yf.download() retourne un MultiIndex de colonnes même pour 1 seul symbole,
-    ex: ('Close', 'EURUSD=X') au lieu de 'Close'.
-    On aplatit le MultiIndex avant de passer en minuscules.
+    yf.download() retourne un MultiIndex de colonnes meme pour 1 seul symbole.
+    On aplatit avant de passer en minuscules.
+
+    CORRECTIF Rate Limit :
+    En cas de YFRateLimitError, on attend retry_delay secondes et on reessaie
+    jusqu'a retries fois avant de retourner un DataFrame vide.
     """
-    try:
-        df = yf.download(
-            symbol,
-            interval=interval,
-            period=period,
-            auto_adjust=True,
-            progress=False,
-            multi_level_index=False,   # yfinance >= 0.2.51 : désactive le MultiIndex direct
-        )
-    except TypeError:
-        # Ancienne version yfinance — ne connaît pas multi_level_index
-        df = yf.download(
-            symbol,
-            interval=interval,
-            period=period,
-            auto_adjust=True,
-            progress=False,
-        )
+    for attempt in range(1, retries + 1):
+        try:
+            try:
+                df = yf.download(
+                    symbol,
+                    interval=interval,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    multi_level_index=False,
+                )
+            except TypeError:
+                df = yf.download(
+                    symbol,
+                    interval=interval,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                )
 
-    if df.empty:
-        return df
+            if df.empty:
+                return df
 
-    # Aplatissement sécurisé : MultiIndex ou colonnes simples
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0).str.lower()
-    else:
-        df.columns = df.columns.str.lower()
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0).str.lower()
+            else:
+                df.columns = df.columns.str.lower()
 
-    df.dropna(inplace=True)
-    return df
+            df.dropna(inplace=True)
+            return df
+
+        except Exception as e:
+            err_str = str(e).lower()
+            if ("rate" in err_str or "too many" in err_str or "429" in err_str) \
+                    and attempt < retries:
+                time.sleep(retry_delay * attempt)
+                continue
+            return pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────
 #  ANALYSE HTF — BIAIS DIRECTIONNEL
@@ -505,6 +508,194 @@ def detect_liquidity_sweep(df: pd.DataFrame) -> dict:
     return result
 
 # ─────────────────────────────────────────────────────────────
+#  BREAKER BLOCK  (OB mitiqué qui flippe de direction)
+# ─────────────────────────────────────────────────────────────
+def detect_breaker_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[dict]:
+    """
+    Breaker Block = Order Block qui a été mitiqué (prix a traversé la zone)
+    puis retesté → flippe en zone opposée.
+
+    Logique :
+      BOS baissier → cherche la dernière bougie bullish avant le BOS
+                     Si le prix est revenu tester cette zone par en haut → Breaker bearish
+      BOS haussier → cherche la dernière bougie bearish avant le BOS
+                     Si le prix est revenu tester cette zone par en bas → Breaker bullish
+
+    Utilisé comme setup clé (voir charts BTC 45MIN FVG + Breaker).
+    """
+    breakers = []
+    for bos in bos_list[-6:]:
+        idx = bos["index"]
+        if idx < OB_LOOKBACK + 2 or idx + 3 >= len(df):
+            continue
+        bos_type = bos["type"]
+
+        for j in range(idx - 1, max(idx - OB_LOOKBACK - 1, 0), -1):
+            is_bull = df["close"].iloc[j] > df["open"].iloc[j]
+            ob_hi   = df["high"].iloc[j]
+            ob_lo   = df["low"].iloc[j]
+
+            if bos_type == "bearish" and is_bull:
+                # OB bullish retesté par en haut = Breaker bearish
+                post_high = df["high"].iloc[idx: min(idx + 15, len(df))].max()
+                if ob_lo <= post_high <= ob_hi * 1.001:
+                    breakers.append({
+                        "direction": "bearish",
+                        "top"      : ob_hi,
+                        "bottom"   : ob_lo,
+                        "index"    : j,
+                    })
+                    break
+
+            elif bos_type == "bullish" and not is_bull:
+                # OB bearish retesté par en bas = Breaker bullish
+                post_low = df["low"].iloc[idx: min(idx + 15, len(df))].min()
+                if ob_lo * 0.999 <= post_low <= ob_hi:
+                    breakers.append({
+                        "direction": "bullish",
+                        "top"      : ob_hi,
+                        "bottom"   : ob_lo,
+                        "index"    : j,
+                    })
+                    break
+
+    return breakers
+
+
+# ─────────────────────────────────────────────────────────────
+#  TRENDLINE LIQUIDITY  (liquidité au-dessus/dessous d'une TL)
+# ─────────────────────────────────────────────────────────────
+def detect_trendline_liquidity(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Trendline Liquidity = série de 3+ swing highs/lows formant une trendline
+    avec des stops accumulés au-dessus/en-dessous.
+    Retourne True si le prix vient de sweeper cette trendline (stop hunt).
+
+    Vu sur le chart EUR/USD : Trendline liquidity sweep avant short.
+    """
+    if len(df) < 25:
+        return False
+
+    window = df.iloc[-25:]
+
+    def swing_highs(w):
+        sh = []
+        for i in range(1, len(w) - 1):
+            if w["high"].iloc[i] > w["high"].iloc[i-1] and w["high"].iloc[i] > w["high"].iloc[i+1]:
+                sh.append((i, w["high"].iloc[i]))
+        return sh
+
+    def swing_lows(w):
+        sl = []
+        for i in range(1, len(w) - 1):
+            if w["low"].iloc[i] < w["low"].iloc[i-1] and w["low"].iloc[i] < w["low"].iloc[i+1]:
+                sl.append((i, w["low"].iloc[i]))
+        return sl
+
+    last_close = window["close"].iloc[-1]
+
+    if direction == "bearish":
+        shs = swing_highs(window)
+        if len(shs) >= 2:
+            # Highs descendants = trendline baissière = liquidité au-dessus
+            if shs[-1][1] < shs[-2][1]:
+                tl_level = shs[-1][1]
+                last_high = window["high"].iloc[-1]
+                # Sweep = dernier high dépasse la TL puis close en dessous
+                if last_high > tl_level and last_close < tl_level:
+                    return True
+
+    elif direction == "bullish":
+        sls = swing_lows(window)
+        if len(sls) >= 2:
+            # Lows ascendants = trendline haussière = liquidité en dessous
+            if sls[-1][1] > sls[-2][1]:
+                tl_level = sls[-1][1]
+                last_low = window["low"].iloc[-1]
+                # Sweep = dernier low passe sous la TL puis close au-dessus
+                if last_low < tl_level and last_close > tl_level:
+                    return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+#  FVG VALIDE (non mitiqué)
+# ─────────────────────────────────────────────────────────────
+def is_fvg_unmitigated(df: pd.DataFrame, fvg: "FVG") -> bool:
+    """
+    Un FVG est 'valid' si le prix n'a PAS fermé à l'intérieur de la zone
+    depuis sa formation. Vu sur EUR/USD : 'Valid FVG' comme zone d'entrée.
+    """
+    if fvg.index + 1 >= len(df):
+        return True
+
+    lo = min(fvg.top, fvg.bottom)
+    hi = max(fvg.top, fvg.bottom)
+
+    for i in range(fvg.index + 1, len(df)):
+        close = df["close"].iloc[i]
+        if lo <= close <= hi:
+            return False   # Mitiqué — prix a fermé dedans
+
+    return True   # Toujours valide
+
+
+# ─────────────────────────────────────────────────────────────
+#  FVG 30min  (équivalent 45MIN FVG des charts BTC)
+# ─────────────────────────────────────────────────────────────
+def detect_fvg_30m(df_30m: pd.DataFrame, direction: str) -> Optional["FVG"]:
+    """
+    Détecte un FVG actif sur le 30min (substitut du 45min que yfinance
+    ne supporte pas). Prix actuel doit être dans la zone du FVG.
+    Logique identique à active_fvg() mais sur le 30m.
+    """
+    fvgs = detect_fvg(df_30m)
+    return active_fvg(df_30m, fvgs, direction)
+
+
+# ─────────────────────────────────────────────────────────────
+#  UPCOMING BOS  (prochain niveau de structure à casser = cible TP)
+# ─────────────────────────────────────────────────────────────
+def detect_upcoming_bos(df: pd.DataFrame, direction: str) -> Optional[float]:
+    """
+    Upcoming BOS = prochain swing low (pour short) ou swing high (pour long)
+    qui n'a pas encore été cassé. Utilisé comme niveau cible (TP).
+    Vu sur EUR/USD chart : 'Upcoming BOS' comme target final.
+    """
+    if len(df) < 15:
+        return None
+
+    window = df.iloc[-30:]
+
+    if direction == "SHORT":
+        # Cherche le swing low le plus récent non cassé = prochain BOS baissier
+        candidate = None
+        for i in range(len(window) - 2, 0, -1):
+            lo = window["low"].iloc[i]
+            if lo < window["low"].iloc[i-1] and lo < window["low"].iloc[i+1]:
+                # Vérifie que ce low n'a pas encore été cassé
+                subsequent = window["low"].iloc[i+1:]
+                if (subsequent > lo).all():
+                    candidate = lo
+                    break
+        return candidate
+
+    elif direction == "LONG":
+        candidate = None
+        for i in range(len(window) - 2, 0, -1):
+            hi = window["high"].iloc[i]
+            if hi > window["high"].iloc[i-1] and hi > window["high"].iloc[i+1]:
+                subsequent = window["high"].iloc[i+1:]
+                if (subsequent < hi).all():
+                    candidate = hi
+                    break
+        return candidate
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
 #  VÉRIFICATION FVG ACTIF (prix dans la zone)
 # ─────────────────────────────────────────────────────────────
 def active_fvg(df: pd.DataFrame, fvgs: list[FVG], direction: str) -> Optional[FVG]:
@@ -530,60 +721,98 @@ def compute_score(
     liquidity_taken: bool,
     bias_aligned: bool,
     # ── Bonus 3-TF ──────────────────────────────
-    mtf_bos: bool = False,      # BOS confirmé sur M15
-    mtf_ob: bool  = False,      # OB confirmé sur M15
-    ltf_fvg: bool = False,      # FVG actif sur M5
-    ltf_confirm: bool = False,  # Bougie confirmation M5 (engulfing / pin bar)
-    entry_m1: bool = False,     # Trigger M1 actif
+    mtf_bos: bool = False,       # BOS confirmé sur M15
+    mtf_ob: bool  = False,       # OB confirmé sur M15
+    ltf_fvg: bool = False,       # FVG actif sur M5
+    ltf_confirm: bool = False,   # Bougie confirmation M5 (engulfing / pin bar)
+    entry_m1: bool = False,      # Trigger M1 actif
+    # ── Bonus setups avancés (charts BTC + EUR/USD) ──────────
+    breaker_block: bool  = False,  # Breaker Block détecté (OB mitiqué flipé)
+    fvg_30m: bool        = False,  # FVG 30min actif (équivalent 45MIN FVG BTC)
+    fvg_unmitigated: bool = False, # FVG Valid (non mitiqué) — EUR/USD setup
+    trendline_liq: bool  = False,  # Trendline Liquidity sweepée
+    older_block: bool    = False,  # Older Block HTF confirmé (H1 OB actif)
 ) -> tuple[int, list[str]]:
     """
-    Score composite sur 100 — architecture 3 TF (H1 → M15 → M5/M1).
-    Seuls les setups avec confluence multi-TF atteignent le seuil 80.
+    Score composite sur 100 — architecture multi-TF avec setups avancés.
+
+    Setups intégrés :
+      • BTC  1H  : 45MIN FVG + Breaker Block + Liquidity Sweep
+      • EUR/USD 15m : Older Block + Trendline Liq + Valid FVG + Upcoming BOS
     """
     score   = 0
     reasons = []
 
     # ── H1 Biais (base) ──────────────────────────────────────
     if bias_aligned:
-        score += 25
-        reasons.append(f"✅ Biais H1 {bias} aligné  (+25)")
+        score += 20
+        reasons.append(f"✅ Biais H1 {bias} aligné  (+20)")
 
     # ── M15 Structure ─────────────────────────────────────────
     if mtf_bos:
-        score += 20
-        reasons.append("✅ BOS M15 confirmé  (+20)")
+        score += 15
+        reasons.append("✅ BOS M15 confirmé  (+15)")
     elif has_bos:
-        score += 10
-        reasons.append("☑️ BOS M5 détecté  (+10)")
+        score += 8
+        reasons.append("☑️ BOS M5 détecté  (+8)")
 
     if mtf_ob:
-        score += 15
-        reasons.append("✅ Order Block M15 validé  (+15)")
+        score += 10
+        reasons.append("✅ Order Block M15 validé  (+10)")
     elif has_ob:
-        score += 8
-        reasons.append("☑️ Order Block M5  (+8)")
+        score += 5
+        reasons.append("☑️ Order Block M5  (+5)")
 
     # ── Liquidité prise ──────────────────────────────────────
     if liquidity_taken:
-        score += 15
-        reasons.append("✅ Stop Hunt / Liquidité prise  (+15)")
+        score += 12
+        reasons.append("✅ Stop Hunt / Liquidité prise  (+12)")
 
     # ── M5 FVG + confirmation bougie ─────────────────────────
     if ltf_fvg:
-        score += 15
-        reasons.append("✅ FVG M5 actif — prix dans la zone  (+15)")
+        score += 10
+        reasons.append("✅ FVG M5 actif — prix dans la zone  (+10)")
     elif has_fvg:
-        score += 7
-        reasons.append("☑️ FVG détecté  (+7)")
+        score += 5
+        reasons.append("☑️ FVG détecté  (+5)")
 
     if ltf_confirm:
-        score += 10
-        reasons.append("✅ Bougie de confirmation M5 (engulfing/pin)  (+10)")
+        score += 8
+        reasons.append("✅ Bougie de confirmation M5 (engulfing/pin)  (+8)")
 
-    # ── Trigger M1 (bonus élite) ─────────────────────────────
+    # ── Trigger M1 ───────────────────────────────────────────
     if entry_m1:
         score += 5
         reasons.append("⚡ Trigger M1 actif — entrée précise  (+5)")
+
+    # ══════════════════════════════════════════════════════════
+    #  SETUPS AVANCÉS  (BTC 45MIN FVG + EUR/USD Trendline)
+    # ══════════════════════════════════════════════════════════
+
+    # Breaker Block (OB mitiqué flipé — setup BTC chart)
+    if breaker_block:
+        score += 12
+        reasons.append("🔥 Breaker Block détecté — zone flippée  (+12)")
+
+    # FVG 30min / équivalent 45MIN FVG (chart BTC)
+    if fvg_30m:
+        score += 10
+        reasons.append("📍 FVG 30min actif — zone 45min POI  (+10)")
+
+    # FVG Valid non mitiqué (chart EUR/USD — 'Valid FVG')
+    if fvg_unmitigated:
+        score += 8
+        reasons.append("✅ FVG valide non mitiqué — entrée propre  (+8)")
+
+    # Trendline Liquidity sweepée (chart EUR/USD)
+    if trendline_liq:
+        score += 10
+        reasons.append("🎯 Trendline Liquidity sweepée — stop hunt  (+10)")
+
+    # Older Block HTF actif (chart EUR/USD — résistance H1)
+    if older_block:
+        score += 10
+        reasons.append("🏛️ Older Block HTF actif — confluence HTF  (+10)")
 
     return min(score, 100), reasons
 
@@ -688,13 +917,14 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"  {c(f'H1 → {mtf} → {ltf}/M1', 'cyan')}")
         print(c("═" * 60, "cyan"))
 
-    # ── Téléchargement 4 TF ──────────────────────────────────
+    # ── Téléchargement 5 TF (H1 / 30m / M15 / M5 / M1) ────────
     if not silent:
-        print(f"  {c('↓', 'cyan')} Data  {htf} / {mtf} / {ltf} / {etf} …")
-    df_htf = fetch(symbol, htf, period="10d")
-    df_mtf = fetch(symbol, mtf, period="5d")
-    df_ltf = fetch(symbol, ltf, period="2d")
-    df_etf = fetch(symbol, etf, period="1d")
+        print(f"  {c('↓', 'cyan')} Data  {htf} / 30m / {mtf} / {ltf} / {etf} …")
+    df_htf  = fetch(symbol, htf,   period="10d")
+    df_30m  = fetch(symbol, MTF2,  period="5d")   # 30min ≈ 45MIN FVG
+    df_mtf  = fetch(symbol, mtf,   period="5d")
+    df_ltf  = fetch(symbol, ltf,   period="2d")
+    df_etf  = fetch(symbol, etf,   period="1d")
 
     if df_htf.empty or df_mtf.empty or df_ltf.empty:
         if not silent:
@@ -753,30 +983,77 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         m1_cnf   = detect_confirmation_candle(df_etf, direction)
         entry_m1 = (fvg_m1 is not None) or m1_cnf
 
-    # ── Score 3-TF ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    #  SETUPS AVANCÉS — intégrés depuis charts BTC + EUR/USD
+    # ══════════════════════════════════════════════════════════
+
+    # Breaker Block sur M15 (OB mitiqué flipé — setup BTC chart)
+    bkr_mtf    = detect_breaker_blocks(df_mtf, bos_mtf)
+    breaker_block = any(b["direction"] == bias.lower() for b in bkr_mtf)
+
+    # FVG 30min actif (équivalent 45MIN FVG — chart BTC)
+    fvg_30m_active = detect_fvg_30m(df_30m, bias.lower()) if not df_30m.empty else None
+    fvg_30m    = fvg_30m_active is not None
+
+    # FVG Valid non mitiqué sur M5 (chart EUR/USD — 'Valid FVG')
+    fvg_unmitigated = False
+    if fvg_active is not None:
+        fvg_unmitigated = is_fvg_unmitigated(df_ltf, fvg_active)
+
+    # Trendline Liquidity sweepée sur M15 (chart EUR/USD)
+    trendline_liq = detect_trendline_liquidity(df_mtf, bias.lower())
+
+    # Older Block HTF = OB H1 actif sur la zone actuelle (chart EUR/USD)
+    bos_htf    = detect_bos(df_htf)
+    obs_htf    = detect_order_blocks(df_htf, bos_htf)
+    price_now  = df_ltf["close"].iloc[-1]
+    older_block = any(
+        o.direction == bias.lower() and
+        min(o.top, o.bottom) <= price_now <= max(o.top, o.bottom)
+        for o in obs_htf
+    )
+
+    # Upcoming BOS comme niveau TP additionnel (chart EUR/USD)
+    upcoming_bos = detect_upcoming_bos(df_mtf, direction)
+
+    # ── Score multi-TF + setups avancés ──────────────────────
     score, reasons = compute_score(
         bias, direction,
         has_bos  = has_bos_ltf,
         has_fvg  = ltf_fvg,
         has_ob   = has_ob_ltf,
-        liquidity_taken = liq_taken,
-        bias_aligned    = True,
-        mtf_bos  = mtf_bos,
-        mtf_ob   = mtf_ob,
-        ltf_fvg  = ltf_fvg,
-        ltf_confirm = ltf_confirm,
-        entry_m1 = entry_m1,
+        liquidity_taken  = liq_taken,
+        bias_aligned     = True,
+        mtf_bos          = mtf_bos,
+        mtf_ob           = mtf_ob,
+        ltf_fvg          = ltf_fvg,
+        ltf_confirm      = ltf_confirm,
+        entry_m1         = entry_m1,
+        breaker_block    = breaker_block,
+        fvg_30m          = fvg_30m,
+        fvg_unmitigated  = fvg_unmitigated,
+        trendline_liq    = trendline_liq,
+        older_block      = older_block,
     )
 
     # ── Affichage détails ────────────────────────────────────
     def tick(v): return c("✓", "green") if v else c("✗", "red")
     if not silent:
-        print(f"  {'BOS M15':<22} {tick(mtf_bos)}")
-        print(f"  {'OB M15':<22} {tick(mtf_ob)}")
-        print(f"  {'Liquidité prise (M15)':<22} {tick(liq_taken)}")
-        print(f"  {'FVG M5 actif':<22} {tick(ltf_fvg)}")
-        print(f"  {'Confirmation M5':<22} {tick(ltf_confirm)}")
-        print(f"  {'Trigger M1':<22} {tick(entry_m1)}")
+        print(f"  {'BOS M15':<26} {tick(mtf_bos)}")
+        print(f"  {'OB M15':<26} {tick(mtf_ob)}")
+        print(f"  {'Liquidité prise (M15)':<26} {tick(liq_taken)}")
+        print(f"  {'FVG M5 actif':<26} {tick(ltf_fvg)}")
+        print(f"  {'FVG Valid (non mitiqué)':<26} {tick(fvg_unmitigated)}")
+        print(f"  {'Confirmation M5':<26} {tick(ltf_confirm)}")
+        print(f"  {'Trigger M1':<26} {tick(entry_m1)}")
+        print(f"  {c('── Setups Avancés ──', 'cyan')}")
+        print(f"  {'Breaker Block M15':<26} {tick(breaker_block)}")
+        print(f"  {'FVG 30min (≈45min)':<26} {tick(fvg_30m)}")
+        print(f"  {'Trendline Liq. sweepée':<26} {tick(trendline_liq)}")
+        print(f"  {'Older Block HTF':<26} {tick(older_block)}")
+        if upcoming_bos:
+            dec_u = 2 if price_now > 100 else 5
+            print(f"  {'Upcoming BOS (target)':<26} {c(str(round(upcoming_bos, dec_u)), 'magenta')}") 
         bar_filled = int(score / 5)
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
         sc  = "green" if score >= 80 else ("yellow" if score >= 60 else "red")
@@ -791,6 +1068,18 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     price        = df_ltf["close"].iloc[-1]
     decimals     = 2 if price > 100 else 5
     sl, tp, rr   = compute_sl_tp(df_ltf, direction, ob_for_sl)
+
+    # Si un Upcoming BOS est détecté et offre un meilleur RR → utilise-le comme TP
+    if upcoming_bos is not None:
+        risk = abs(price - sl)
+        if risk > 0:
+            rr_bos = round(abs(upcoming_bos - price) / risk, 2)
+            if direction == "SHORT" and upcoming_bos < price and rr_bos > rr:
+                tp  = round(upcoming_bos, decimals)
+                rr  = rr_bos
+            elif direction == "LONG" and upcoming_bos > price and rr_bos > rr:
+                tp  = round(upcoming_bos, decimals)
+                rr  = rr_bos
 
     # ── Filtre RR minimum ────────────────────────────────────
     if rr < MIN_RR:
@@ -1024,6 +1313,74 @@ CATEGORY_ALIASES = CATEGORY_MAP
 
 def get_symbols(cat: str) -> list[tuple[str, str]]:
     return CATEGORY_MAP.get(cat, TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA)
+
+
+# ─────────────────────────────────────────────────────────────
+#  AFFICHAGE LISTE DES MARCHÉS AU DÉMARRAGE
+# ─────────────────────────────────────────────────────────────
+def print_market_list(symbols: list[tuple[str, str]]) -> None:
+    """
+    Affiche au démarrage la liste complète des marchés qui vont être scannés,
+    groupés par TIER (Gold/BTC → Forex majeures → Croisées/Indices),
+    avec le symbole technique yfinance de chaque paire.
+    """
+    tier1_set = {s[0] for s in TIER_1_PRIORITY}
+    tier2_set = {s[0] for s in TIER_2_FOREX}
+
+    groups: list[tuple[str, list[tuple[str, str]]]] = [
+        ("🥇  TIER 1  —  Gold / BTC / Commodités Prioritaires", []),
+        ("🥈  TIER 2  —  Forex Majeures",                       []),
+        ("🥉  TIER 3  —  Croisées / Exotiques / Indices",       []),
+    ]
+
+    for sym, name in symbols:
+        if sym in tier1_set:
+            groups[0][1].append((sym, name))
+        elif sym in tier2_set:
+            groups[1][1].append((sym, name))
+        else:
+            groups[2][1].append((sym, name))
+
+    total   = len(symbols)
+    W       = 68   # largeur intérieure du cadre
+
+    sep_top = "╔" + "═" * W + "╗"
+    sep_mid = "╠" + "═" * W + "╣"
+    sep_bot = "╚" + "═" * W + "╝"
+
+    def row(text: str) -> str:
+        return "║  " + text + " " * max(0, W - 2 - len(text)) + "║"
+
+    print(f"\n{sep_top}")
+    print(row(f"📋  WATCHLIST COMPLÈTE  —  {total} MARCHÉS SCANNÉS"))
+    print(row(f"   Score min : {SCORE_THRESHOLD}/100   |   RR min : 1:{MIN_RR}   |   Scan : toutes les 30s"))
+    print(sep_mid)
+
+    grand_i = 1
+    for tier_name, group in groups:
+        if not group:
+            continue
+
+        print(row(f"{tier_name}  ({len(group)} marchés)"))
+        print(row("─" * (W - 4)))
+
+        # 2 colonnes
+        for j in range(0, len(group), 2):
+            sym1, name1 = group[j]
+            col1 = f"{grand_i:>2}. {name1:<18}  {sym1:<13}"
+            grand_i += 1
+            if j + 1 < len(group):
+                sym2, name2 = group[j + 1]
+                col2 = f"{grand_i:>2}. {name2:<18}  {sym2}"
+                grand_i += 1
+            else:
+                col2 = ""
+            line = col1 + col2
+            print(row(line))
+
+        print(row(""))   # ligne vide entre tiers
+
+    print(sep_bot + "\n")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1271,85 +1628,208 @@ def startup_check() -> bool:
     except Exception as e:
         log.warning(f"  ⚠ Test groupe échoué : {e}")
 
-    # Test données marché
-    try:
-        df = fetch("GBPUSD=X", "5m", period="1d")
-        if not df.empty:
-            log.info("  ✓ Données marché (yfinance) OK")
-        else:
-            log.error("  ✗ yfinance ne retourne pas de données")
-            return False
-    except Exception as e:
-        log.error(f"  ✗ Erreur yfinance : {e}")
-        return False
+    # Test données marché — non bloquant (rate limit possible au démarrage)
+    yf_ok = False
+    for attempt in range(1, 4):
+        try:
+            df = fetch("GBPUSD=X", "5m", period="1d")
+            if not df.empty:
+                log.info("  ✓ Données marché (yfinance) OK")
+                yf_ok = True
+                break
+            else:
+                log.warning(f"  ⚠ yfinance vide — tentative {attempt}/3")
+                time.sleep(20 * attempt)
+        except Exception as e:
+            log.warning(f"  ⚠ yfinance erreur tentative {attempt}/3 : {e}")
+            time.sleep(20 * attempt)
 
-    log.info("  ✓ Tous les checks passés — démarrage du scan\n")
-    return True
+    if not yf_ok:
+        log.warning("  ⚠ yfinance indisponible au démarrage — démarrage quand même.")
+        log.warning("  ⚠ Le bot va attendre 60s puis relancer le scan.")
+
+    log.info("  ✓ Démarrage du scan\n")
+    return True  # On démarre toujours — erreur yfinance gérée dans la boucle
+
+
+def _reasons_flags(reasons: list[str]) -> tuple[str, str, str, str]:
+    """
+    Extrait 4 drapeaux (BOS / FVG / OB / LIQ) depuis la liste reasons d'un Signal.
+    Retourne une tuple de 4 chaînes "✓" ou "✗".
+    """
+    has_bos = any("BOS"      in r for r in reasons)
+    has_fvg = any("FVG"      in r for r in reasons)
+    has_ob  = any("Block"    in r or "Order" in r or "OB" in r for r in reasons)
+    has_liq = any("Liquidit" in r or "Hunt"  in r or "Stop" in r for r in reasons)
+    return (
+        c("✓", "green") if has_bos else c("✗", "red"),
+        c("✓", "green") if has_fvg else c("✗", "red"),
+        c("✓", "green") if has_ob  else c("✗", "red"),
+        c("✓", "green") if has_liq else c("✗", "red"),
+    )
+
+
+def _tier_of(sym: str) -> str:
+    """Retourne le label tier court d'un symbole."""
+    t1 = {s[0] for s in TIER_1_PRIORITY}
+    t2 = {s[0] for s in TIER_2_FOREX}
+    if sym in t1:
+        return c("T1🥇", "yellow")
+    if sym in t2:
+        return c("T2🥈", "cyan")
+    return c("T3🥉", "white")
 
 
 def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
              min_rr: float = MIN_RR, interval: int = 30) -> None:
     """
     Boucle principale VPS :
-      - Scan toutes les 30s
-      - Actif uniquement pendant les sessions London / NY
-      - Max MAX_SIGNALS_PER_DAY signaux par paire par jour
-      - 1 signal envoyé à la fois (cooldown anti-spam)
-      - Survie aux erreurs réseau sans crash
+      ① Affiche la liste complète des marchés scannés au démarrage
+      ② À chaque cycle (toutes les {interval}s) :
+            - Tableau de statut  : prix actuel + confirmations SMC
+              (BOS / FVG / OB / Liquidité / Score / RR) pour CHAQUE marché
+            - Signal Telegram envoyé UNIQUEMENT si :
+                score >= min_score  ET  RR >= min_rr  ET  toutes confirmations
+      ③ Survie aux erreurs réseau sans crash
     """
     if not startup_check():
         log.error("  Startup check échoué — arrêt.")
         return
 
     symbols = get_symbols(cat)
+
+    # ── ① Liste des marchés ────────────────────────────────────
+    print_market_list(symbols)
     log.info(f"  Watchlist : {len(symbols)} paire(s) — cat={cat}")
 
     consecutive_errors = 0
+    cycle_n = 0
 
     while True:
         try:
-            active, session_name = is_active_session()
-            now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            cycle_n += 1
+            now_utc  = datetime.now(timezone.utc)
+            now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            now_hhmm = now_utc.strftime("%H:%M UTC")
 
-            if not active:
-                log.info(f"  💤 {now_str} — {session_name} — prochain check dans 5 min")
-                time.sleep(300)
-                continue
+            log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols)} paires")
 
-            log.info(f"  🔍 {now_str} — Session : {session_name} — {len(symbols)} paires")
+            # ── ② Entête tableau ───────────────────────────────
+            W = 90
+            print(f"\n{'╔' + '═'*W + '╗'}")
+            print(f"║  🔍  CYCLE #{cycle_n}  —  {now_str}  —  {len(symbols)} MARCHÉS"
+                  + " " * max(0, W - 4 - 8 - len(now_str) - len(str(len(symbols))) - 17) + "║")
+            print(f"║  Score min : {min_score}/100   RR min : 1:{min_rr}   "
+                  + "Confirmations requises : BOS + FVG + OB + Liquidité"
+                  + " " * max(0, W - 4 - 13 - len(str(min_score)) - 3 -
+                               len(str(min_rr)) - 50) + "║")
+            print(f"{'╠' + '═'*W + '╣'}")
 
-            for sym, mkt in symbols:
-                # ── Limite journalière ──────────────────────────
-                if not check_daily_limit(sym):
-                    continue
+            # En-têtes colonnes
+            hdr = (f"  {'N°':<4} {'Tier':<4} {'Marché':<14} {'Symbole':<12}"
+                   f"  {'Prix':>14}  {'Biais':>7}  "
+                   f"{'BOS':>4} {'FVG':>4} {'OB':>4} {'LIQ':>4}"
+                   f"  {'Score':>6}  {'RR':>6}  Statut")
+            print(hdr)
+            print(f"  {'─'*88}")
+
+            signals_found: list[tuple[str, str, "Signal", str]] = []   # (mkt, sym, sig, tier_label)
+
+            # ── Scan marché par marché ─────────────────────────
+            for i, (sym, mkt) in enumerate(symbols, 1):
+                tier = _tier_of(sym)
+                prefix = f"  {i:<4} {tier}  {mkt:<14} {c(sym, 'cyan'):<12}"
+                print(prefix + "  … ", end="", flush=True)
 
                 try:
                     sig = analyse(sym, silent=True)
 
-                    if sig and sig.score >= min_score and sig.rr >= min_rr:
-                        log.info(f"  ⚡ SIGNAL {sig.direction} {mkt}  "
-                                 f"score={sig.score}  RR=1:{sig.rr}  lot={sig.lot}")
+                    if sig is None:
+                        # Pas de setup — on récupère quand même le prix pour info
+                        try:
+                            df_peek = fetch(sym, LTF, period="1d")
+                            if not df_peek.empty:
+                                px   = df_peek["close"].iloc[-1]
+                                dec  = 2 if px > 100 else 5
+                                px_s = str(round(px, dec))
+                            else:
+                                px_s = "—"
+                        except Exception:
+                            px_s = "—"
+                        print(f"\r{prefix}  {px_s:>14}  {'—':>7}  "
+                              f"{'—':>4} {'—':>4} {'—':>4} {'—':>4}"
+                              f"  {'—':>6}  {'—':>6}  ⚪ Pas de setup")
 
-                        # tg_notify gère le cooldown anti-spam
-                        cache_key = f"{sig.symbol}:{sig.direction}"
-                        now_ts = time.time()
-                        last   = _signal_cache.get(cache_key, 0)
+                    else:
+                        # Signal calculé — affichage détaillé
+                        px   = sig.entry
+                        dec  = 2 if px > 100 else 5
+                        px_s = str(round(px, dec))
 
-                        if now_ts - last >= SIGNAL_COOLDOWN:
-                            tg_notify(sig, tier="TIER 2 🥈  FOREX MAJEURES")
-                            increment_daily_count(sym)
-                            log.info(f"    ✓ Envoyé — quota jour : "
-                                     f"{_daily_count.get(sym,0)}/{MAX_SIGNALS_PER_DAY}")
+                        bos_f, fvg_f, ob_f, liq_f = _reasons_flags(sig.reasons)
+
+                        sc_color = "green" if sig.score >= 80 else ("yellow" if sig.score >= 60 else "red")
+                        rr_color = "green" if sig.rr >= 3 else ("yellow" if sig.rr >= 2 else "red")
+                        dir_clr  = "red"   if sig.direction == "SHORT" else "green"
+                        dir_icon = "🔴" if sig.direction == "SHORT" else "🟢"
+
+                        if sig.score >= min_score and sig.rr >= min_rr:
+                            # Toutes les confirmations validées → signal valide
+                            status = c(f"⚡ SIGNAL {sig.direction} — EN COURS D'ENVOI", dir_clr)
+
+                            # Détermine le tier pour le label Telegram
+                            raw_tier = next(
+                                (lbl for lbl, grp in TIER_LABELS.items()
+                                 if any(s == sym for s, _ in grp)),
+                                "TIER 2 🥈  FOREX MAJEURES"
+                            )
+                            signals_found.append((mkt, sym, sig, raw_tier))
+
+                        elif sig.score >= int(min_score * 0.75):
+                            status = c(f"🟡 Proche  ({sig.score}/100)", "yellow")
                         else:
-                            rem = int(SIGNAL_COOLDOWN - (now_ts - last))
-                            log.info(f"    ⏳ Cooldown {rem}s")
+                            status = c(f"🔵 En attente  ({sig.score}/100)", "white")
 
-                    # Pause courte entre paires pour ne pas flooder yfinance
-                    time.sleep(1)
+                        print(f"\r{prefix}  {px_s:>14}  "
+                              f"{c(sig.htf_bias[:4], dir_clr):>7}  "
+                              f"{bos_f:>4} {fvg_f:>4} {ob_f:>4} {liq_f:>4}  "
+                              f"{c(str(sig.score), sc_color):>6}  "
+                              f"{c('1:'+str(sig.rr), rr_color):>6}  "
+                              f"{status}")
+
+                    time.sleep(1)   # anti-flood yfinance
 
                 except Exception as e:
-                    log.warning(f"    ⚠ Erreur {mkt} : {e}")
+                    print(f"\r{prefix}  {'—':>14}  {'—':>7}  "
+                          f"{'—':>4} {'—':>4} {'—':>4} {'—':>4}"
+                          f"  {'—':>6}  {'—':>6}  "
+                          + c(f"⚠ {str(e)[:38]}", "red"))
                     continue
+
+            # ── Séparateur + résumé ────────────────────────────
+            print(f"  {'─'*88}")
+
+            if signals_found:
+                print(c(f"\n  ⚡ {len(signals_found)} SIGNAL(S) VALIDÉ(S) — "
+                        "Toutes les confirmations sont présentes :", "yellow"))
+                for mkt, sym, sig, tier_lbl in signals_found:
+                    dir_clr = "red" if sig.direction == "SHORT" else "green"
+                    print(c(f"    → {mkt} ({sym})  {sig.direction}  "
+                            f"score={sig.score}/100  RR=1:{sig.rr}  "
+                            f"lot={sig.lot}  entry={sig.entry}", dir_clr))
+            else:
+                print(c("  ℹ️  Aucun signal valide ce cycle "
+                        f"(score≥{min_score} + RR≥{min_rr} requis).", "white"))
+
+            # ── Envoi Telegram des signaux validés ─────────────
+            for mkt, sym, sig, tier_lbl in signals_found:
+                log.info(f"  ⚡ SIGNAL {sig.direction} {mkt}  "
+                         f"score={sig.score}  RR=1:{sig.rr}  lot={sig.lot}")
+                tg_notify(sig, tier=tier_lbl)
+                log.info(f"    ✓ Signal Telegram envoyé → {mkt}")
+
+            # ── Pied de tableau ────────────────────────────────
+            print(f"\n{'╚' + '═'*W + '╝'}")
 
             consecutive_errors = 0
             log.info(f"  ⏳ Prochain scan dans {interval}s\n")
