@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║          SMC SIGNAL ENGINE  v2  — Smart Money Concepts              ║
@@ -219,21 +220,36 @@ ATR_MIN: dict[str, float] = {
 }
 ATR_MIN_DEFAULT = 0.00050  # fallback pour symboles non listés
 
-# Sessions actives UTC — on ne scanne que London + NY
-# London  : 07:00 → 16:00 UTC
-# New York: 12:00 → 21:00 UTC
-# Overlap : 12:00 → 16:00 UTC (meilleure liquidité)
-SESSION_START_UTC = 7    # heure ouverture London
-SESSION_END_UTC   = 21   # heure fermeture NY
+# ─────────────────────────────────────────────────────────────
+#  SESSIONS ACTIVES (UTC) — fenêtres de liquidité réelle uniquement
+#
+#  London open   : 07:00 → 10:00 UTC  (run initial + vraie liquidité)
+#  NY open       : 13:00 → 16:00 UTC  (US session + overlap London)
+#
+#  Exclus intentionnellement :
+#    03:00–07:00 UTC  → Asia late / pre-London  : manipulation, faible volume
+#    10:00–13:00 UTC  → Mid-London dull zone     : range comprimé
+#    16:00–21:00 UTC  → NY post-open / fin NY    : fades & consolidation
+#    21:00–03:00 UTC  → Asie early / nuit        : marché mort
+# ─────────────────────────────────────────────────────────────
+SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
+    (7,  10),   # London open
+    (13, 16),   # NY open + overlap
+]
 
 # Ratio spread/ATR max — si spread > X% de l'ATR → skip (RR impossible)
 MAX_SPREAD_ATR_RATIO = 0.25   # spread ne doit pas dépasser 25% de l'ATR M5
 
 
 def is_session_active() -> bool:
-    """Retourne True si on est dans London ou NY session (UTC)."""
+    """
+    Retourne True uniquement pendant les fenêtres haute-liquidité :
+      London open  07:00–10:00 UTC
+      NY open      13:00–16:00 UTC
+    Tout le reste (pre-London, mid-London dull, post-NY, Asia) → False.
+    """
     hour = datetime.now(timezone.utc).hour
-    return SESSION_START_UTC <= hour < SESSION_END_UTC
+    return any(start <= hour < end for start, end in SESSION_WINDOWS_UTC)
 
 
 def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
@@ -339,8 +355,89 @@ def get_spread(symbol: str) -> float:
     return SPREAD_TABLE.get(symbol, 0.00015)
 
 # ─────────────────────────────────────────────────────────────
-#  TELEGRAM
+#  CORRÉLATION — GARDE ANTI-SUREXPOSITION DEVISE
+#
+#  Problème : EURUSD LONG + GBPUSD LONG + NZDUSD LONG simultanément
+#  = 3× le risque USD sur le même mouvement macro.
+#  Risque réel = 3 × $25 = $75 sur un seul facteur (DXY).
+#
+#  Solution : un seul trade actif par "groupe devise dominante".
+#  Groupes :
+#    USD_LONG  → paires où USD est coté (EURUSD, GBPUSD, AUDUSD, NZDUSD)
+#                 + USD/XXX sens contraire (USDCHF SHORT, USDCAD SHORT)
+#    USD_SHORT → idem sens inverse
+#    JPY_LONG / JPY_SHORT → toutes paires JPY
+#    GBP / EUR / AUD / NZD groupes secondaires
+#
+#  Règle : si un signal de même groupe+direction est déjà actif → BLOQUÉ.
 # ─────────────────────────────────────────────────────────────
+
+# Mapping symbole → devise dominante exposée
+# Convention : la devise DOMINANTE est celle qui subit le mouvement macro.
+_CORR_GROUPS: dict[str, str] = {
+    # ── USD comme terme coté (EUR/USD, GBP/USD…) → exposition USD ──
+    "EURUSD=X": "USD", "GBPUSD=X": "USD", "AUDUSD=X": "USD",
+    "NZDUSD=X": "USD",
+    # ── USD comme base (USD/JPY…) → exposition USD inverse ──────────
+    "USDJPY=X": "USD", "USDCHF=X": "USD", "USDCAD=X": "USD",
+    "USDMXN=X": "USD", "USDZAR=X": "USD", "USDTRY=X": "USD",
+    "USDSEK=X": "USD", "USDNOK=X": "USD", "USDSGD=X": "USD",
+    "USDHKD=X": "USD", "USDDKK=X": "USD",
+    # ── JPY croisées → exposition JPY ────────────────────────────────
+    "GBPJPY=X": "JPY", "EURJPY=X": "JPY", "AUDJPY=X": "JPY",
+    "CADJPY=X": "JPY", "CHFJPY=X": "JPY", "NZDJPY=X": "JPY",
+    # ── GBP croisées → exposition GBP ────────────────────────────────
+    "GBPAUD=X": "GBP", "GBPCAD=X": "GBP", "GBPNZD=X": "GBP",
+    "GBPCHF=X": "GBP", "EURGBP=X": "GBP",
+    # ── EUR croisées → exposition EUR ────────────────────────────────
+    "EURAUD=X": "EUR", "EURCAD=X": "EUR", "EURNZD=X": "EUR",
+    "EURCHF=X": "EUR",
+    # ── AUD croisées → exposition AUD ────────────────────────────────
+    "AUDCAD=X": "AUD", "AUDCHF=X": "AUD", "AUDNZD=X": "AUD",
+    # ── NZD croisées ─────────────────────────────────────────────────
+    "NZDCAD=X": "NZD", "NZDCHF=X": "NZD",
+    # ── Commodités / Crypto / Indices → groupes propres ──────────────
+    "GC=F": "GOLD", "SI=F": "GOLD",
+    "CL=F": "OIL",  "BZ=F": "OIL", "NG=F": "OIL",
+    "BTC-USD": "BTC",
+    "^GSPC": "US_IDX", "^NDX": "US_IDX", "^DJI": "US_IDX",
+    "^GDAXI": "EU_IDX", "^FCHI": "EU_IDX", "^FTSE": "EU_IDX",
+}
+
+# État actif : groupe+direction → True si un trade a déjà été validé ce cycle
+# Réinitialisé au début de chaque cycle de scan dans run_live().
+_active_corr_groups: dict[str, bool] = {}
+
+
+def correlation_guard_reset() -> None:
+    """Réinitialise le registre de corrélation — appeler au début de chaque cycle."""
+    _active_corr_groups.clear()
+
+
+def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
+    """
+    Vérifie si un trade corrélé est déjà actif pour ce cycle.
+
+    Retourne (autorisé, raison_si_bloqué).
+      True  → trade autorisé, groupe enregistré.
+      False → trade bloqué, risque corrélé détecté.
+
+    Appeler APRÈS que le signal est validé (score + RR OK),
+    AVANT l'envoi Telegram.
+    """
+    group = _CORR_GROUPS.get(symbol)
+    if group is None:
+        return True, ""   # symbole non mappé → pas de garde
+
+    key = f"{group}:{direction}"
+
+    if _active_corr_groups.get(key, False):
+        return False, f"corrélation {group} {direction} déjà active ce cycle"
+
+    _active_corr_groups[key] = True
+    return True, ""
+
+
 TELEGRAM_TOKEN    = "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI"
 TELEGRAM_CHAT_ID  = None          # Auto-détecté au premier lancement (DM personnel)
 TELEGRAM_GROUP_ID = "-1002335466840"  # Groupe Telegram
@@ -1205,14 +1302,17 @@ def compute_sl_tp(
 # ─────────────────────────────────────────────────────────────
 def detect_confirmation_candle(df: pd.DataFrame, direction: str) -> bool:
     """
-    Détecte une bougie de confirmation sur les 3 dernières bougies :
+    Détecte une bougie de confirmation sur les 3 dernières bougies CLÔTURÉES.
       LONG  → Bullish Engulfing ou Pin Bar haussière (mèche basse > corps × 2)
       SHORT → Bearish Engulfing ou Pin Bar baissière (mèche haute > corps × 2)
+
+    NOTE : on commence à iloc[-2] (dernière bougie clôturée).
+    iloc[-1] est la bougie en cours de formation → données incomplètes → bruit.
     """
-    if len(df) < 3:
+    if len(df) < 4:
         return False
 
-    for i in range(-1, -4, -1):
+    for i in range(-2, -5, -1):   # [-2, -3, -4] — bougies clôturées uniquement
         o = df["open"].iloc[i]
         h = df["high"].iloc[i]
         l = df["low"].iloc[i]
@@ -2072,6 +2172,9 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
             log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols)} paires")
 
+            # ── Reset garde corrélation pour ce cycle ──────────
+            correlation_guard_reset()
+
             # ── ② Entête tableau ───────────────────────────────
             W = 90
             print(f"\n{'╔' + '═'*W + '╗'}")
@@ -2146,16 +2249,21 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
                         dir_icon = "🔴" if sig.direction == "SHORT" else "🟢"
 
                         if sig.score >= min_score and sig.rr >= min_rr:
-                            # Toutes les confirmations validées → signal valide
-                            status = c(f"⚡ SIGNAL {sig.direction} — EN COURS D'ENVOI", dir_clr)
+                            # ── Garde corrélation ──────────────────────
+                            corr_ok, corr_reason = correlation_guard(sym, sig.direction)
+                            if not corr_ok:
+                                status = c(f"🟠 Corrélé — {corr_reason}", "yellow")
+                            else:
+                                # Toutes les confirmations validées → signal valide
+                                status = c(f"⚡ SIGNAL {sig.direction} — EN COURS D'ENVOI", dir_clr)
 
-                            # Détermine le tier pour le label Telegram
-                            raw_tier = next(
-                                (lbl for lbl, grp in TIER_LABELS.items()
-                                 if any(s == sym for s, _ in grp)),
-                                "TIER 2 🥈  FOREX MAJEURES"
-                            )
-                            signals_found.append((mkt, sym, sig, raw_tier))
+                                # Détermine le tier pour le label Telegram
+                                raw_tier = next(
+                                    (lbl for lbl, grp in TIER_LABELS.items()
+                                     if any(s == sym for s, _ in grp)),
+                                    "TIER 2 🥈  FOREX MAJEURES"
+                                )
+                                signals_found.append((mkt, sym, sig, raw_tier))
 
                         elif sig.score >= int(min_score * 0.75):
                             status = c(f"🟡 Proche  ({sig.score}/100)", "yellow")
@@ -2304,5 +2412,4 @@ if __name__ == "__main__":
             min_rr    = args.min_rr,
             interval  = args.interval,
         )
-
 
