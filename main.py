@@ -174,7 +174,7 @@ FVG_MIN_RATIO   = 0.0002   # FVG plus sensible sur M5/M1
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
 SCORE_THRESHOLD = 80       # Seuil élevé → signaux élite uniquement
-MIN_RR          = 2.0      # RR atteignable rapidement sur M5/M1
+MIN_RR          = 3.0      # RR net spread minimum — M5 entry
 RISK_USD        = 25.0     # Risque fixe par position en USD
 
 # ─────────────────────────────────────────────────────────────
@@ -472,64 +472,62 @@ def c(text: str, color: str = "green") -> str:
 def compute_lot(symbol: str, entry: float, sl: float,
                 risk_usd: float = RISK_USD) -> float:
     """
-    Calcule la taille de lot pour un risque fixe en USD.
+    Taille de lot pour risque fixe en USD.
+    Basé sur la distance entry→SL (risque réel de la position).
 
-    Formules par type de paire :
-      XXX/USD  (EURUSD, GBPUSD, AUDUSD, NZDUSD)
-          pip = 0.0001  |  pip_value/lot = $10
-          lot = risk / (sl_pips × 10)
+    Formule universelle : lot = risk_usd / (sl_distance × pip_value_per_lot)
 
-      USD/JPY
-          pip = 0.01    |  pip_value/lot ≈ $1000 / rate
-          lot = risk × rate / (sl_pips × 1000)
-
-      USD/CHF  USD/CAD  (USD base, autre quote)
-          pip = 0.0001  |  pip_value/lot ≈ $10 / rate
-          lot = risk × rate / (sl_pips × 10)
-
-      XXX/JPY  (croisées JPY)
-          pip = 0.01    |  pip_value/lot ≈ $1000 / rate
-          lot = risk × rate / (sl_pips × 1000)
-
-      Gold (GC=F / XAUUSD)
-          $1 = $100/lot (contrat 100 oz)
-          lot = risk / (sl_distance × 100)
-
-      BTC/Crypto  — lot ignoré (taille unitaire)
+    pip_value_per_lot par type :
+      XXX/USD (EUR,GBP,AUD,NZD + USD)  → pip=0.0001  val=$10/lot
+      USD/XXX (CHF,CAD)                → pip=0.0001  val=$10/entry
+      XXX/JPY ou USD/JPY               → pip=0.01    val=$1000/entry (≈ $10/0.01/lot à rate≈100)
+      Gold GC=F                        → $1 = $100/lot  (100 oz)
+      Silver SI=F                      → $1 = $50/lot   (5000 oz)
+      Oil CL/BZ                        → $1 = $1000/lot (1000 barils)
+      Indices                          → point = $50/lot (approx SPX)
+      BTC/ETH                          → lot = risk_usd / sl_distance
     """
     sl_distance = abs(entry - sl)
     if sl_distance == 0:
         return 0.0
 
-    sym = symbol.upper().replace("=X", "").replace("-", "")
+    sym = symbol.upper().replace("=X", "").replace("-", "").replace("^", "")
 
-    # ── Gold / Silver ────────────────────────────────────────
-    if symbol in ("GC=F", "SI=F") or sym in ("XAUUSD", "XAGUSD"):
+    # ── Commodités ───────────────────────────────────────────
+    if symbol in ("GC=F",) or sym == "XAUUSD":
+        lot = risk_usd / (sl_distance * 100.0)
+    elif symbol in ("SI=F",) or sym == "XAGUSD":
+        lot = risk_usd / (sl_distance * 50.0)
+    elif symbol in ("CL=F", "BZ=F"):
+        lot = risk_usd / (sl_distance * 1000.0)
+    elif symbol in ("NG=F", "HG=F", "PL=F", "PA=F"):
         lot = risk_usd / (sl_distance * 100.0)
 
-    # ── Crypto BTC ──────────────────────────────────────────
-    elif symbol in ("BTC-USD", "ETH-USD") or sym in ("BTCUSD", "ETHUSD"):
-        lot = risk_usd / (sl_distance * 1.0)   # 1 unité BTC = 1 BTC
-        lot = round(lot, 6)
+    # ── Crypto ───────────────────────────────────────────────
+    elif sym in ("BTCUSD", "ETHUSD") or symbol in ("BTC-USD", "ETH-USD"):
+        lot = round(risk_usd / sl_distance, 6)
         return lot
 
-    # ── Croisées et majeures JPY ─────────────────────────────
+    # ── Indices ──────────────────────────────────────────────
+    elif sym in ("GSPC", "NDX", "DJI", "GDAXI", "FCHI", "FTSE", "N225", "HSI"):
+        lot = risk_usd / (sl_distance * 10.0)
+
+    # ── JPY (toutes paires) ──────────────────────────────────
     elif sym.endswith("JPY"):
         sl_pips = sl_distance / 0.01
-        pip_val = 1000.0 / entry          # USD par pip par lot
+        pip_val = 1000.0 / entry      # ~$10/pip/lot quand rate≈100
         lot = risk_usd / (sl_pips * pip_val)
 
-    # ── USD comme base (USDCHF, USDCAD, USDJPY déjà géré) ──
+    # ── USD comme base (USDCHF, USDCAD, USDHKD, USDSGD…) ───
     elif sym.startswith("USD"):
         sl_pips = sl_distance / 0.0001
-        pip_val = 10.0 / entry            # USD par pip par lot
+        pip_val = 10.0 / entry
         lot = risk_usd / (sl_pips * pip_val)
 
-    # ── Paires XXX/USD standard ──────────────────────────────
+    # ── XXX/USD standard (EUR, GBP, AUD, NZD, NZD…) ────────
     else:
         sl_pips = sl_distance / 0.0001
-        pip_val = 10.0                    # $10 par pip par lot standard
-        lot = risk_usd / (sl_pips * pip_val)
+        lot = risk_usd / (sl_pips * 10.0)
 
     lot = max(0.01, round(lot, 2))
     return lot
@@ -1037,7 +1035,7 @@ def compute_score(
     return min(score, 100), reasons
 
 # ─────────────────────────────────────────────────────────────
-#  CALCUL SL / TP  — RR MINIMUM GARANTI
+#  CALCUL ENTRÉE / SL / TP — RR NET SPREAD GARANTI ≥ 3
 # ─────────────────────────────────────────────────────────────
 def compute_sl_tp(
     df: pd.DataFrame,
@@ -1045,42 +1043,74 @@ def compute_sl_tp(
     ob: Optional[OrderBlock],
     min_rr: float = MIN_RR,
     symbol: str = "",
-) -> tuple[float, float, float]:
+    fvg: Optional["FVG"] = None,
+) -> tuple[float, float, float, float]:
     """
-    Calcule SL, TP et RR réel NET de spread.
-    - SL = bord de l'OB (si dispo) ou ATR × 1.2
-    - TP forcé à entrée ± (risk × min_rr) pour garantir le RR minimum.
-    - Le spread est déduit du gain brut avant calcul du RR net.
-      LONG  : gain_net = (TP - entry) - spread      [on paie le spread à l'achat]
-      SHORT : gain_net = (entry - TP) - spread      [on paie le spread à la vente]
-    Retourne (sl, tp, rr_net).
-    """
-    price    = df["close"].iloc[-1]
-    atr      = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-    spread   = get_spread(symbol) if symbol else 0.0
+    Retourne (entry, sl, tp, rr_net) avec RR net spread GARANTI ≥ min_rr.
 
-    if direction == "SHORT":
-        sl   = ob.top    if ob else price + atr * 1.2
-        risk = abs(price - sl)
-        # TP naturel = swing low ou ATR × 2 ; mais au minimum RR × risk
-        tp_natural = price - atr * 2.5
-        tp_min_rr  = price - risk * min_rr
-        tp = min(tp_natural, tp_min_rr)        # prend le plus bas (plus favorable)
-        gain_net = abs(tp - price) - spread
+    ═══ LOGIQUE RÉELLE ═══════════════════════════════════════════
+
+    Le trader paie le spread UNE FOIS à l'ouverture (buy ask / sell bid).
+    Quand le TP est touché, le P&L réel est :
+        LONG  : P&L = (TP - entry) - spread   [achat au ask = entry + spread/2 × 2]
+        SHORT : P&L = (entry - TP) - spread
+
+    Pour garantir P&L = risk × min_rr quand TP est touché :
+        LONG  : TP = entry + risk × min_rr + spread
+        SHORT : TP = entry - risk × min_rr - spread
+
+    Le TP ATR × 4 est pris s'il est encore plus favorable (plus loin).
+
+    ═══ ENTRÉE ════════════════════════════════════════════════════
+    Priorité 1 : milieu du FVG M5/M15 actif  → zone de valeur optimale
+    Priorité 2 : close M5 courant            → fallback
+
+    ═══ STOP LOSS ═════════════════════════════════════════════════
+    LONG  : sl = ob.bottom - atr × 0.25   (sous le bas de l'OB)
+    SHORT : sl = ob.top    + atr × 0.25   (au-dessus du haut de l'OB)
+    Sans OB : sl = entry ∓ atr × 1.5
+    """
+    atr    = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    close  = df["close"].iloc[-1]
+    spread = get_spread(symbol) if symbol else 0.0
+    dec    = 2 if close > 100 else 5
+
+    # ── 1. ENTRÉE ────────────────────────────────────────────
+    if fvg is not None:
+        fvg_hi  = max(fvg.top, fvg.bottom)
+        fvg_lo  = min(fvg.top, fvg.bottom)
+        entry   = round((fvg_hi + fvg_lo) / 2.0, dec)
     else:
-        sl   = ob.bottom if ob else price - atr * 1.2
-        risk = abs(price - sl)
-        tp_natural = price + atr * 2.5
-        tp_min_rr  = price + risk * min_rr
-        tp = max(tp_natural, tp_min_rr)        # prend le plus haut
-        gain_net = abs(tp - price) - spread
+        entry   = round(close, dec)
 
-    # RR net = gain après déduction du spread / risque brut
-    rr_real = round(gain_net / risk, 2) if risk and gain_net > 0 else 0.0
+    # ── 2. STOP LOSS (bord OB + petit buffer ATR) ────────────
+    buf = atr * 0.25
+    if direction == "LONG":
+        sl = round((ob.bottom - buf) if ob else (entry - atr * 1.5), dec)
+    else:
+        sl = round((ob.top    + buf) if ob else (entry + atr * 1.5), dec)
 
-    # Arrondi adapté selon le prix (crypto vs forex vs or)
-    decimals = 2 if price > 100 else 5
-    return round(sl, decimals), round(tp, decimals), rr_real
+    risk = round(abs(entry - sl), dec + 2)
+    if risk <= 0:
+        return entry, sl, entry, 0.0
+
+    # ── 3. TAKE PROFIT ───────────────────────────────────────
+    # TP minimal pour RR net = min_rr exactement après spread
+    if direction == "LONG":
+        tp_rr_net = entry + risk * min_rr + spread   # garanti RR net = min_rr
+        tp_atr    = entry + atr * 4.0                # TP naturel ATR × 4
+        tp = round(max(tp_rr_net, tp_atr), dec)      # prend le plus favorable (plus haut)
+        gain_net = (tp - entry) - spread
+    else:
+        tp_rr_net = entry - risk * min_rr - spread
+        tp_atr    = entry - atr * 4.0
+        tp = round(min(tp_rr_net, tp_atr), dec)      # plus bas = plus favorable SHORT
+        gain_net = (entry - tp) - spread
+
+    # ── 4. RR net réel (recalculé sur le TP final) ───────────
+    rr_net = round(gain_net / risk, 2) if gain_net > 0 and risk > 0 else 0.0
+
+    return entry, sl, tp, rr_net
 
 # ─────────────────────────────────────────────────────────────
 #  BOUGIE DE CONFIRMATION M5/M1
@@ -1295,19 +1325,29 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
     price        = df_ltf["close"].iloc[-1]
     decimals     = 2 if price > 100 else 5
-    sl, tp, rr   = compute_sl_tp(df_ltf, direction, ob_for_sl, symbol=symbol)
+    entry, sl, tp, rr = compute_sl_tp(
+        df_ltf, direction, ob_for_sl,
+        symbol=symbol,
+        fvg=fvg_active,          # entrée au milieu du FVG M5
+    )
 
-    # Si un Upcoming BOS est détecté et offre un meilleur RR → utilise-le comme TP
+    # Si un Upcoming BOS est détecté et offre un meilleur RR net → utilise-le comme TP
     if upcoming_bos is not None:
-        risk = abs(price - sl)
+        spread = get_spread(symbol)
+        risk   = abs(entry - sl)
         if risk > 0:
-            rr_bos = round(abs(upcoming_bos - price) / risk, 2)
-            if direction == "SHORT" and upcoming_bos < price and rr_bos > rr:
-                tp  = round(upcoming_bos, decimals)
-                rr  = rr_bos
-            elif direction == "LONG" and upcoming_bos > price and rr_bos > rr:
-                tp  = round(upcoming_bos, decimals)
-                rr  = rr_bos
+            if direction == "SHORT" and upcoming_bos < entry:
+                gain_net_bos = (entry - upcoming_bos) - spread
+                rr_bos = round(gain_net_bos / risk, 2)
+                if rr_bos > rr:
+                    tp  = round(upcoming_bos, decimals)
+                    rr  = rr_bos
+            elif direction == "LONG" and upcoming_bos > entry:
+                gain_net_bos = (upcoming_bos - entry) - spread
+                rr_bos = round(gain_net_bos / risk, 2)
+                if rr_bos > rr:
+                    tp  = round(upcoming_bos, decimals)
+                    rr  = rr_bos
 
     # ── Filtre RR minimum ────────────────────────────────────
     if rr < MIN_RR:
@@ -1315,12 +1355,12 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             print(c(f"\n  ✗ RR insuffisant ({rr} < {MIN_RR}) — signal rejeté.", "yellow"))
         return None
 
-    lot = compute_lot(symbol, round(price, decimals), sl)
+    lot = compute_lot(symbol, entry, sl)
 
     signal = Signal(
         symbol    = symbol,
         direction = direction,
-        entry     = round(price, decimals),
+        entry     = entry,
         sl        = sl,
         tp        = tp,
         rr        = rr,
@@ -1342,10 +1382,11 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"\n  {c('━'*56, 'cyan')}")
         print(f"  {c('⚡ SIGNAL ÉLITE DÉTECTÉ', 'yellow')}  →  {c(direction, dir_color)}  {entry_mode}")
         print(f"  {c('━'*56, 'cyan')}")
+        entry_src   = "🎯 FVG mid" if fvg_active else "📍 close M5"
         print(f"  {'Symbole':<18} {c(signal.symbol, 'white')}")
         print(f"  {'Direction':<18} {c(signal.direction, dir_color)}")
         print(f"  {'─'*40}")
-        print(f"  {'📍 Entrée':<18} {c(str(signal.entry), 'white')}")
+        print(f"  {'📍 Entrée':<18} {c(str(signal.entry), 'white')}   ← {entry_src}")
         print(f"  {'🔴 Stop Loss':<18} {c(str(signal.sl), 'red')}   "
               f"← risk = {c(str(round(abs(signal.entry - signal.sl), decimals)), 'red')}")
         print(f"  {'🟢 Take Profit':<18} {c(str(signal.tp), 'green')}   "
