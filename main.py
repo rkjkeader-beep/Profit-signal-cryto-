@@ -1,3 +1,4 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║          SMC SIGNAL ENGINE  v2  — Smart Money Concepts              ║
@@ -324,10 +325,42 @@ def compute_lot(symbol: str, entry: float, sl: float,
 
 
 def fetch(symbol: str, interval: str, period: str = "5d") -> pd.DataFrame:
-    """Télécharge les OHLCV via yfinance."""
-    df = yf.download(symbol, interval=interval, period=period,
-                     auto_adjust=True, progress=False)
-    df.columns = [col.lower() for col in df.columns]
+    """
+    Télécharge les OHLCV via yfinance.
+
+    CORRECTIF yfinance >= 0.2.x :
+    yf.download() retourne un MultiIndex de colonnes même pour 1 seul symbole,
+    ex: ('Close', 'EURUSD=X') au lieu de 'Close'.
+    On aplatit le MultiIndex avant de passer en minuscules.
+    """
+    try:
+        df = yf.download(
+            symbol,
+            interval=interval,
+            period=period,
+            auto_adjust=True,
+            progress=False,
+            multi_level_index=False,   # yfinance >= 0.2.51 : désactive le MultiIndex direct
+        )
+    except TypeError:
+        # Ancienne version yfinance — ne connaît pas multi_level_index
+        df = yf.download(
+            symbol,
+            interval=interval,
+            period=period,
+            auto_adjust=True,
+            progress=False,
+        )
+
+    if df.empty:
+        return df
+
+    # Aplatissement sécurisé : MultiIndex ou colonnes simples
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0).str.lower()
+    else:
+        df.columns = df.columns.str.lower()
+
     df.dropna(inplace=True)
     return df
 
@@ -1354,8 +1387,8 @@ if __name__ == "__main__":
                             "forex_all = Forex complet\n"
                             "all       = Tout scanner"
                         ))
-    parser.add_argument("--live",      action="store_true",
-                        help="Mode live VPS — scan toutes les 30s, sessions London/NY")
+    parser.add_argument("--scan",      action="store_true",
+                        help="Scan unique (test local uniquement — quitte après 1 scan)")
     parser.add_argument("--min-score", type=int,   default=SCORE_THRESHOLD,
                         help=f"Score minimum  (défaut: {SCORE_THRESHOLD})")
     parser.add_argument("--min-rr",    type=float, default=MIN_RR,
@@ -1365,19 +1398,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.symbol:
+        # ── Analyse d'un seul symbole ─────────────────────────
         sig = analyse(args.symbol)
         if sig:
             tg_notify(sig, tier="TIER 1")
-    elif args.live:
+
+    elif args.scan:
+        # ── Scan unique (test local — NE PAS utiliser sur Render) ──
+        symbols = get_symbols(args.cat)
+        scan_watchlist(symbols, HTF, LTF, args.min_score, args.min_rr)
+
+    else:
+        # ── MODE LIVE — défaut sur VPS / Render ──────────────
+        # Boucle infinie : Render maintient le processus actif.
         run_live(
             cat       = args.cat,
             min_score = args.min_score,
             min_rr    = args.min_rr,
             interval  = args.interval,
         )
-    else:
-        # Scan unique (test)
-        symbols = get_symbols(args.cat)
-        scan_watchlist(symbols, HTF, LTF, args.min_score, args.min_rr)
-
 
