@@ -28,7 +28,9 @@ Usage :
 """
 
 import argparse
+import threading
 import time
+import os
 import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -37,6 +39,119 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# ── Flask — serveur HTTP pour Render (Web Service) ────────────
+from flask import Flask, jsonify
+
+flask_app = Flask(__name__)
+
+# ── État partagé — mis à jour par run_live() ─────────────────
+_STATUS: dict = {
+    "started_at"     : None,
+    "last_scan"      : None,
+    "cycle"          : 0,
+    "symbols_count"  : 0,
+    "last_signals"   : [],     # liste des derniers signaux envoyés
+    "scan_running"   : False,
+}
+_STATUS_LOCK = threading.Lock()
+
+
+@flask_app.route("/")
+def index():
+    """Dashboard de statut HTML — lisible dans le navigateur Render."""
+    with _STATUS_LOCK:
+        st = dict(_STATUS)
+
+    signals_html = ""
+    for s in reversed(st["last_signals"][-10:]):
+        color = "#e74c3c" if s["direction"] == "SHORT" else "#2ecc71"
+        signals_html += (
+            f'<tr>'
+            f'<td>{s["ts"]}</td>'
+            f'<td><b>{s["market"]}</b></td>'
+            f'<td style="color:{color};font-weight:bold">{s["direction"]}</td>'
+            f'<td>{s["entry"]}</td>'
+            f'<td style="color:#e74c3c">{s["sl"]}</td>'
+            f'<td style="color:#2ecc71">{s["tp"]}</td>'
+            f'<td>1:{s["rr"]}</td>'
+            f'<td>{s["score"]}/100</td>'
+            f'<td>{s["lot"]} lot</td>'
+            f'</tr>'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="30">
+  <title>SMC Signal Engine</title>
+  <style>
+    body  {{ font-family: monospace; background:#0d1117; color:#c9d1d9; margin:2em; }}
+    h1    {{ color:#58a6ff; }}
+    h2    {{ color:#8b949e; border-bottom:1px solid #30363d; padding-bottom:.3em; }}
+    table {{ border-collapse:collapse; width:100%; }}
+    th    {{ background:#161b22; color:#8b949e; padding:.5em 1em; text-align:left; }}
+    td    {{ padding:.4em 1em; border-bottom:1px solid #21262d; }}
+    .ok   {{ color:#2ecc71; }} .warn {{ color:#f39c12; }} .err {{ color:#e74c3c; }}
+    .badge{{ display:inline-block; padding:.2em .6em; border-radius:4px;
+             font-size:.85em; font-weight:bold; }}
+    .live {{ background:#2ecc71; color:#000; }}
+    .idle {{ background:#f39c12; color:#000; }}
+  </style>
+</head>
+<body>
+  <h1>⚡ SMC Signal Engine</h1>
+  <p>
+    Statut : <span class="badge {'live' if st['scan_running'] else 'idle'}">
+      {'🟢 SCAN ACTIF' if st['scan_running'] else '🟡 EN ATTENTE'}
+    </span>
+    &nbsp;|&nbsp;
+    Démarré : <b>{st['started_at'] or '—'}</b>
+    &nbsp;|&nbsp;
+    Cycle : <b>#{st['cycle']}</b>
+    &nbsp;|&nbsp;
+    Marchés : <b>{st['symbols_count']}</b>
+    &nbsp;|&nbsp;
+    Dernier scan : <b>{st['last_scan'] or '—'}</b>
+  </p>
+  <p style="color:#8b949e;font-size:.85em">⟳ Page rafraîchie toutes les 30 secondes</p>
+
+  <h2>📋 Derniers signaux envoyés</h2>
+  {'<p class="warn">Aucun signal validé pour le moment.</p>' if not st['last_signals'] else f"""
+  <table>
+    <tr>
+      <th>Heure UTC</th><th>Marché</th><th>Direction</th>
+      <th>Entrée</th><th>SL 🔴</th><th>TP 🟢</th>
+      <th>R:R</th><th>Score</th><th>Lot</th>
+    </tr>
+    {signals_html}
+  </table>"""}
+
+  <h2>⚙️ Configuration</h2>
+  <table>
+    <tr><th>Paramètre</th><th>Valeur</th></tr>
+    <tr><td>Score minimum</td><td>{SCORE_THRESHOLD}/100</td></tr>
+    <tr><td>RR minimum</td><td>1:{MIN_RR}</td></tr>
+    <tr><td>Risque par trade</td><td>${RISK_USD}</td></tr>
+    <tr><td>Timeframes</td><td>H1 → M15 → M5 / M1</td></tr>
+    <tr><td>Intervalle scan</td><td>30 secondes</td></tr>
+  </table>
+</body>
+</html>"""
+    return html
+
+
+@flask_app.route("/status")
+def status_json():
+    """Endpoint JSON — pour monitoring externe."""
+    with _STATUS_LOCK:
+        return jsonify(_STATUS)
+
+
+def start_flask(port: int = 10000) -> None:
+    """Lance Flask dans un thread daemon (ne bloque pas run_live)."""
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 try:
     from colorama import Fore, Style, init as colorama_init
@@ -63,6 +178,79 @@ MIN_RR          = 2.0      # RR atteignable rapidement sur M5/M1
 RISK_USD        = 25.0     # Risque fixe par position en USD
 
 # ─────────────────────────────────────────────────────────────
+#  SPREADS TYPIQUES PAR INSTRUMENT  (en prix brut, pas en pips)
+#  Source : spreads moyens broker ECN hors news
+#  Intégrés au RR : le vrai gain net = TP - (entry + spread)
+# ─────────────────────────────────────────────────────────────
+SPREAD_TABLE: dict[str, float] = {
+    # ── Forex majeures (pips × 0.0001) ──────────────────────
+    "EURUSD=X": 0.00008,   # 0.8 pip
+    "GBPUSD=X": 0.00010,   # 1.0 pip
+    "USDJPY=X": 0.009,     # 0.9 pip  (× 0.01)
+    "USDCHF=X": 0.00010,   # 1.0 pip
+    "AUDUSD=X": 0.00010,   # 1.0 pip
+    "NZDUSD=X": 0.00013,   # 1.3 pip
+    "USDCAD=X": 0.00012,   # 1.2 pip
+    # ── Forex croisées ───────────────────────────────────────
+    "EURGBP=X": 0.00013,
+    "EURJPY=X": 0.012,
+    "EURCHF=X": 0.00018,
+    "EURAUD=X": 0.00020,
+    "EURCAD=X": 0.00020,
+    "EURNZD=X": 0.00025,
+    "GBPJPY=X": 0.018,
+    "GBPCHF=X": 0.00022,
+    "GBPAUD=X": 0.00025,
+    "GBPCAD=X": 0.00025,
+    "GBPNZD=X": 0.00030,
+    "AUDJPY=X": 0.012,
+    "CADJPY=X": 0.015,
+    "CHFJPY=X": 0.015,
+    "NZDJPY=X": 0.015,
+    "AUDCAD=X": 0.00018,
+    "AUDCHF=X": 0.00018,
+    "AUDNZD=X": 0.00020,
+    "NZDCAD=X": 0.00020,
+    "NZDCHF=X": 0.00020,
+    "CADCHF=X": 0.00018,
+    # ── Exotiques ────────────────────────────────────────────
+    "USDMXN=X": 0.003,
+    "USDZAR=X": 0.005,
+    "USDTRY=X": 0.010,
+    "USDSEK=X": 0.004,
+    "USDNOK=X": 0.004,
+    "USDDKK=X": 0.003,
+    "USDSGD=X": 0.00020,
+    "USDHKD=X": 0.00030,
+    # ── Gold / Silver ────────────────────────────────────────
+    "GC=F":     0.30,      # $0.30 / oz
+    "SI=F":     0.015,
+    # ── Pétrole ──────────────────────────────────────────────
+    "CL=F":     0.03,
+    "BZ=F":     0.04,
+    "NG=F":     0.003,
+    "HG=F":     0.003,
+    "PL=F":     0.50,
+    "PA=F":     1.00,
+    # ── Crypto ───────────────────────────────────────────────
+    "BTC-USD":  15.0,      # ~$15 spread moyen
+    "ETH-USD":  0.80,
+    # ── Indices (valeur indice) ───────────────────────────────
+    "^GSPC":    0.30,
+    "^NDX":     0.50,
+    "^DJI":     2.00,
+    "^GDAXI":   1.00,
+    "^FCHI":    1.00,
+    "^FTSE":    1.00,
+    "^N225":    5.00,
+    "^HSI":     5.00,
+}
+
+def get_spread(symbol: str) -> float:
+    """Retourne le spread estimé pour un symbole (défaut 1.5 pip si inconnu)."""
+    return SPREAD_TABLE.get(symbol, 0.00015)
+
+# ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI"
@@ -72,6 +260,28 @@ TELEGRAM_GROUP_ID = "-1002335466840"  # Groupe Telegram
 # ── Anti-spam : évite de renvoyer le même signal avant N secondes ──
 SIGNAL_COOLDOWN  = 600           # 10 minutes par (symbol, direction)
 _signal_cache: dict[str, float] = {}   # clé → timestamp dernier envoi
+
+# ── Un seul signal par setup (symbol + direction + score_bucket) ──
+# Réinitialisé uniquement quand le biais change ou manuellement.
+# Clé : "{symbol}:{direction}:{score_bucket}"  — valeur : True
+_setup_sent: dict[str, bool] = {}
+
+def _setup_key(symbol: str, direction: str, score: int) -> str:
+    """Clé unique de setup : paire + direction + palier de score (tranches de 5 pts)."""
+    bucket = (score // 5) * 5   # ex: score 85 → bucket 85, score 87 → bucket 85
+    return f"{symbol}:{direction}:{bucket}"
+
+def is_setup_already_sent(symbol: str, direction: str, score: int) -> bool:
+    return _setup_sent.get(_setup_key(symbol, direction, score), False)
+
+def mark_setup_sent(symbol: str, direction: str, score: int) -> None:
+    _setup_sent[_setup_key(symbol, direction, score)] = True
+
+def reset_setup(symbol: str) -> None:
+    """Réinitialise les setups d'un symbole (appeler si le biais H1 change)."""
+    keys_to_del = [k for k in _setup_sent if k.startswith(f"{symbol}:")]
+    for k in keys_to_del:
+        del _setup_sent[k]
 
 
 def _tg_url(method: str) -> str:
@@ -136,6 +346,8 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
     dec = 2 if sig.entry > 100 else 5
     risk  = round(abs(sig.entry - sig.sl),  dec)
     gain  = round(abs(sig.tp  - sig.entry), dec)
+    spread_val = get_spread(sig.symbol)
+    spread_disp = round(spread_val, dec)
 
     ts = sig.timestamp.strftime("%d/%m/%Y %H:%M UTC")
     gain_usd = round(sig.risk_usd * sig.rr, 2)
@@ -150,8 +362,9 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
         f"{'─'*30}\n"
         f"<b>📍 Entrée    :</b>  <code>{sig.entry}</code>\n"
         f"<b>🔴 Stop Loss :</b>  <code>{sig.sl}</code>   <i>(risk {risk})</i>\n"
-        f"<b>🟢 Take Profit:</b> <code>{sig.tp}</code>   <i>(gain {gain})</i>\n"
-        f"<b>⚖  R : R     :</b>  <b>1 : {sig.rr}</b>  {rr_bar}\n"
+        f"<b>🟢 Take Profit:</b> <code>{sig.tp}</code>   <i>(gain brut {gain})</i>\n"
+        f"<b>📊 Spread    :</b>  <code>{spread_disp}</code>   <i>(déduit du RR)</i>\n"
+        f"<b>⚖  R : R net :</b>  <b>1 : {sig.rr}</b>  {rr_bar}\n"
         f"{'─'*30}\n"
         f"<b>💰 LOT SIZE  :</b>  <b><code>{sig.lot} lot</code></b>\n"
         f"<b>⚠  Risque    :</b>  <b>${sig.risk_usd}</b>  →  gain ≈ <b>${gain_usd}</b>\n"
@@ -168,6 +381,13 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
 def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> None:
     """Envoie la notification Telegram au DM personnel ET au groupe."""
     global TELEGRAM_CHAT_ID, TELEGRAM_GROUP_ID, _signal_cache
+
+    # ── Garde-fou : un seul signal par setup (paire + direction + score_bucket) ──
+    if is_setup_already_sent(sig.symbol, sig.direction, sig.score):
+        print(c(f"  [TG] ⏭ Setup déjà envoyé — {sig.symbol} {sig.direction} "
+                f"score≈{(sig.score // 5) * 5} — ignoré.", "yellow"))
+        return
+    mark_setup_sent(sig.symbol, sig.direction, sig.score)
 
     # ── Résolution chat_id personnel ──────────────────────────
     cid = chat_id or TELEGRAM_CHAT_ID
@@ -824,15 +1044,20 @@ def compute_sl_tp(
     direction: str,
     ob: Optional[OrderBlock],
     min_rr: float = MIN_RR,
+    symbol: str = "",
 ) -> tuple[float, float, float]:
     """
-    Calcule SL, TP et RR réel.
+    Calcule SL, TP et RR réel NET de spread.
     - SL = bord de l'OB (si dispo) ou ATR × 1.2
     - TP forcé à entrée ± (risk × min_rr) pour garantir le RR minimum.
-    Retourne (sl, tp, rr_réel).
+    - Le spread est déduit du gain brut avant calcul du RR net.
+      LONG  : gain_net = (TP - entry) - spread      [on paie le spread à l'achat]
+      SHORT : gain_net = (entry - TP) - spread      [on paie le spread à la vente]
+    Retourne (sl, tp, rr_net).
     """
-    price = df["close"].iloc[-1]
-    atr   = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    price    = df["close"].iloc[-1]
+    atr      = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    spread   = get_spread(symbol) if symbol else 0.0
 
     if direction == "SHORT":
         sl   = ob.top    if ob else price + atr * 1.2
@@ -841,14 +1066,17 @@ def compute_sl_tp(
         tp_natural = price - atr * 2.5
         tp_min_rr  = price - risk * min_rr
         tp = min(tp_natural, tp_min_rr)        # prend le plus bas (plus favorable)
+        gain_net = abs(tp - price) - spread
     else:
         sl   = ob.bottom if ob else price - atr * 1.2
         risk = abs(price - sl)
         tp_natural = price + atr * 2.5
         tp_min_rr  = price + risk * min_rr
         tp = max(tp_natural, tp_min_rr)        # prend le plus haut
+        gain_net = abs(tp - price) - spread
 
-    rr_real = round(abs(tp - price) / risk, 2) if risk else 0
+    # RR net = gain après déduction du spread / risque brut
+    rr_real = round(gain_net / risk, 2) if risk and gain_net > 0 else 0.0
 
     # Arrondi adapté selon le prix (crypto vs forex vs or)
     decimals = 2 if price > 100 else 5
@@ -1067,7 +1295,7 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
     price        = df_ltf["close"].iloc[-1]
     decimals     = 2 if price > 100 else 5
-    sl, tp, rr   = compute_sl_tp(df_ltf, direction, ob_for_sl)
+    sl, tp, rr   = compute_sl_tp(df_ltf, direction, ob_for_sl, symbol=symbol)
 
     # Si un Upcoming BOS est détecté et offre un meilleur RR → utilise-le comme TP
     if upcoming_bos is not None:
@@ -1124,7 +1352,8 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
               f"← gain = {c(str(round(abs(signal.tp - signal.entry), decimals)), 'green')}")
         print(f"  {'─'*40}")
         print(f"  {'⚖  R : R':<18} {c('1 : ' + str(signal.rr), rr_color)}  "
-              f"{'✓ RR OK' if rr >= MIN_RR else '✗'}")
+              f"{'✓ RR OK' if rr >= MIN_RR else '✗'}  "
+              f"{c('(spread déduit: ' + str(round(get_spread(symbol)*10000 if signal.entry < 10 else get_spread(symbol), 5)) + ')', 'yellow')}")
         print(f"  {'Score':<18} {c(str(signal.score) + ' / 100', score_color)}")
         print(f"  {'Biais H1':<18} {c(signal.htf_bias, dir_color)}")
         print(f"  {'─'*40}")
@@ -1614,13 +1843,9 @@ def startup_check() -> bool:
         log.error(f"  ✗ Connexion Telegram impossible : {e}")
         return False
 
-    # Test groupe
+    # Test groupe (ping silencieux — pas de message envoyé)
     try:
-        r2 = requests.post(_tg_url("sendMessage"), json={
-            "chat_id"   : TELEGRAM_GROUP_ID,
-            "text"      : "🟢 <b>SMC Signal Engine démarré</b> — scan actif toutes les 30s",
-            "parse_mode": "HTML",
-        }, timeout=10)
+        r2 = requests.get(_tg_url("getChat"), params={"chat_id": TELEGRAM_GROUP_ID}, timeout=10)
         if r2.status_code == 200:
             log.info(f"  ✓ Message groupe OK (id={TELEGRAM_GROUP_ID})")
         else:
@@ -1702,8 +1927,16 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
     print_market_list(symbols)
     log.info(f"  Watchlist : {len(symbols)} paire(s) — cat={cat}")
 
+    # ── Initialise le statut Flask ─────────────────────────────
+    with _STATUS_LOCK:
+        _STATUS["started_at"]    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STATUS["symbols_count"] = len(symbols)
+        _STATUS["scan_running"]  = True
+
     consecutive_errors = 0
     cycle_n = 0
+    # Mémorise le dernier biais H1 par symbole pour détecter les retournements
+    _last_bias: dict[str, str] = {}
 
     while True:
         try:
@@ -1711,6 +1944,10 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             now_utc  = datetime.now(timezone.utc)
             now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
             now_hhmm = now_utc.strftime("%H:%M UTC")
+
+            with _STATUS_LOCK:
+                _STATUS["cycle"]     = cycle_n
+                _STATUS["last_scan"] = now_str
 
             log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols)} paires")
 
@@ -1743,6 +1980,15 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
                 try:
                     sig = analyse(sym, silent=True)
+
+                    # ── Détection retournement de biais → reset setups ──
+                    if sig is not None:
+                        new_bias = sig.htf_bias
+                        if _last_bias.get(sym) and _last_bias[sym] != new_bias:
+                            reset_setup(sym)
+                            print(c(f"\n  [SETUP] ♻ Biais {sym} changé "
+                                    f"{_last_bias[sym]}→{new_bias} — setups réinitialisés", "cyan"))
+                        _last_bias[sym] = new_bias
 
                     if sig is None:
                         # Pas de setup — on récupère quand même le prix pour info
@@ -1828,6 +2074,22 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
                 tg_notify(sig, tier=tier_lbl)
                 log.info(f"    ✓ Signal Telegram envoyé → {mkt}")
 
+                # ── Mise à jour dashboard Flask ────────────────
+                with _STATUS_LOCK:
+                    _STATUS["last_signals"].append({
+                        "ts"       : datetime.now(timezone.utc).strftime("%d/%m %H:%M"),
+                        "market"   : mkt,
+                        "direction": sig.direction,
+                        "entry"    : sig.entry,
+                        "sl"       : sig.sl,
+                        "tp"       : sig.tp,
+                        "rr"       : sig.rr,
+                        "score"    : sig.score,
+                        "lot"      : sig.lot,
+                    })
+                    # Garde seulement les 50 derniers signaux
+                    _STATUS["last_signals"] = _STATUS["last_signals"][-50:]
+
             # ── Pied de tableau ────────────────────────────────
             print(f"\n{'╚' + '═'*W + '╝'}")
 
@@ -1877,20 +2139,34 @@ if __name__ == "__main__":
                         help="Intervalle de scan en secondes (défaut: 30)")
     args = parser.parse_args()
 
+    # ── Démarrage Flask en arrière-plan (port Render) ──────────
+    # PORT est injecté par Render automatiquement.
+    # En local, défaut = 10000.
+    flask_port = int(os.environ.get("PORT", 10000))
+    flask_thread = threading.Thread(
+        target=start_flask,
+        args=(flask_port,),
+        daemon=True,      # s'arrête automatiquement si le process principal quitte
+        name="flask-server",
+    )
+    flask_thread.start()
+    # ── Attente 3s : laisse Flask binder le port avant que Render
+    #    fasse son port-scan (évite "No open ports detected")
+    time.sleep(3)
+    log.info(f"  ✓ Flask dashboard actif sur le port {flask_port}")
+
+    # ── Mode selon les arguments ────────────────────────────────
     if args.symbol:
-        # ── Analyse d'un seul symbole ─────────────────────────
         sig = analyse(args.symbol)
         if sig:
             tg_notify(sig, tier="TIER 1")
 
     elif args.scan:
-        # ── Scan unique (test local — NE PAS utiliser sur Render) ──
         symbols = get_symbols(args.cat)
         scan_watchlist(symbols, HTF, LTF, args.min_score, args.min_rr)
 
     else:
-        # ── MODE LIVE — défaut sur VPS / Render ──────────────
-        # Boucle infinie : Render maintient le processus actif.
+        # ── MODE LIVE — boucle infinie (Render Web Service) ────
         run_live(
             cat       = args.cat,
             min_score = args.min_score,
