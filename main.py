@@ -65,12 +65,16 @@ def index():
 
     signals_html = ""
     for s in reversed(st["last_signals"][-10:]):
-        color = "#e74c3c" if s["direction"] == "SHORT" else "#2ecc71"
+        color     = "#e74c3c" if s["direction"] == "SHORT" else "#2ecc71"
+        mode_tag  = s.get("mode", "SMC")
+        mode_col  = "#f39c12" if mode_tag == "PRE-BOS" else "#58a6ff"
         signals_html += (
             f'<tr>'
             f'<td>{s["ts"]}</td>'
             f'<td><b>{s["market"]}</b></td>'
             f'<td style="color:{color};font-weight:bold">{s["direction"]}</td>'
+            f'<td><span style="background:{mode_col};color:#000;padding:2px 6px;'
+            f'border-radius:4px;font-size:.8em;font-weight:bold">{mode_tag}</span></td>'
             f'<td>{s["entry"]}</td>'
             f'<td style="color:#e74c3c">{s["sl"]}</td>'
             f'<td style="color:#2ecc71">{s["tp"]}</td>'
@@ -122,6 +126,7 @@ def index():
   <table>
     <tr>
       <th>Heure UTC</th><th>Marché</th><th>Direction</th>
+      <th>Mode</th>
       <th>Entrée</th><th>SL 🔴</th><th>TP 🟢</th>
       <th>R:R</th><th>Score</th><th>Lot</th>
     </tr>
@@ -153,6 +158,33 @@ def start_flask(port: int = 10000) -> None:
     """Lance Flask dans un thread daemon (ne bloque pas run_live)."""
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+
+def start_self_ping(port: int = 10000) -> None:
+    """
+    Self-ping toutes les 4 minutes pour empêcher Render (plan gratuit)
+    de mettre le container en veille.
+    Le ping cible /status (JSON léger) pour ne pas surcharger.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
+    ping_url = f"{url}/status"
+
+    def _ping_loop():
+        # Attend 30s au démarrage que Flask soit bien up
+        time.sleep(30)
+        while True:
+            try:
+                r = requests.get(ping_url, timeout=10)
+                # Log discret — seulement si échec
+                if r.status_code != 200:
+                    log.warning(f"  ⚠ Self-ping HTTP {r.status_code} → {ping_url}")
+            except Exception as e:
+                log.warning(f"  ⚠ Self-ping échoué : {e}")
+            time.sleep(240)   # toutes les 4 minutes
+
+    t = threading.Thread(target=_ping_loop, daemon=True, name="self-ping")
+    t.start()
+    log.info(f"  ✓ Self-ping actif → {ping_url} (toutes les 4 min)")
+
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
@@ -172,7 +204,7 @@ FVG_MIN_RATIO   = 0.0002   # FVG plus sensible sur M5/M1
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
 SCORE_THRESHOLD = 80       # Seuil élevé → signaux élite uniquement
-MIN_RR          = 3.0      # RR net spread minimum — M5 entry
+MIN_RR          = 2.0      # RR net spread minimum — abaissé pour plus de trades
 RISK_USD        = 25.0     # Risque fixe par position en USD
 
 # ─────────────────────────────────────────────────────────────
@@ -269,8 +301,8 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
     atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT)
     spread  = get_spread(symbol)
 
-    if atr < atr_min:
-        return False, f"ATR trop faible ({round(atr, 5)} < {atr_min})"
+    if atr < atr_min * 0.7:
+        return False, f"ATR trop faible ({round(atr, 5)} < {round(atr_min*0.7,5)})"
 
     ratio = spread / atr if atr > 0 else 1.0
     if ratio > MAX_SPREAD_ATR_RATIO:
@@ -404,9 +436,10 @@ _CORR_GROUPS: dict[str, str] = {
     "^GDAXI": "EU_IDX", "^FCHI": "EU_IDX", "^FTSE": "EU_IDX",
 }
 
-# État actif : groupe+direction → True si un trade a déjà été validé ce cycle
-# Réinitialisé au début de chaque cycle de scan dans run_live().
-_active_corr_groups: dict[str, bool] = {}
+# État actif : groupe+direction → timestamp d'enregistrement
+# Expiré après CORR_TTL secondes (15 min) pour ne pas bloquer trop longtemps
+_active_corr_groups: dict[str, float] = {}
+CORR_TTL = 900   # 15 minutes
 
 
 def correlation_guard_reset() -> None:
@@ -416,29 +449,28 @@ def correlation_guard_reset() -> None:
 
 def correlation_guard(symbol: str, direction: str) -> tuple[bool, str]:
     """
-    Vérifie si un trade corrélé est déjà actif pour ce cycle.
-
-    Retourne (autorisé, raison_si_bloqué).
-      True  → trade autorisé, groupe enregistré.
-      False → trade bloqué, risque corrélé détecté.
-
-    Appeler APRÈS que le signal est validé (score + RR OK),
-    AVANT l'envoi Telegram.
+    Vérifie si un trade corrélé est déjà actif.
+    Reset automatique après CORR_TTL secondes (15 min) — évite de bloquer trop de trades.
     """
     group = _CORR_GROUPS.get(symbol)
     if group is None:
-        return True, ""   # symbole non mappé → pas de garde
+        return True, ""
 
-    key = f"{group}:{direction}"
+    key    = f"{group}:{direction}"
+    now_ts = time.time()
 
-    if _active_corr_groups.get(key, False):
-        return False, f"corrélation {group} {direction} déjà active ce cycle"
+    # Expire les entrées vieilles de > CORR_TTL
+    if key in _active_corr_groups:
+        if now_ts - _active_corr_groups[key] > CORR_TTL:
+            del _active_corr_groups[key]   # expiré → libéré
+        else:
+            return False, f"corrélation {group} {direction} active ({CORR_TTL//60}min TTL)"
 
-    _active_corr_groups[key] = True
+    _active_corr_groups[key] = now_ts
     return True, ""
 
 
-TELEGRAM_TOKEN    = "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI"
+TELEGRAM_TOKEN    = os.environ.get("TG_TOKEN", "8665812395:AAFO4BMTIrBCQJYVL8UytO028TcB1sDfgbI")
 TELEGRAM_CHAT_ID  = None          # Auto-détecté au premier lancement (DM personnel)
 TELEGRAM_GROUP_ID = "-1002335466840"  # Groupe Telegram
 
@@ -543,7 +575,7 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
         f"<b>Marché   :</b>  <code>{sig.symbol}</code>\n"
         f"<b>Direction:</b>  <b>{dir_emoji}</b>\n"
         f"<b>Biais H1 :</b>  {sig.htf_bias}\n"
-        f"<b>TF Entrée:</b>  M5 / M1\n"
+        f"<b>TF Entrée:</b>  M5 / M15\n"
         f"{'─'*30}\n"
         f"<b>📍 Entrée    :</b>  <code>{sig.entry}</code>\n"
         f"<b>🔴 Stop Loss :</b>  <code>{sig.sl}</code>   <i>(risk {risk})</i>\n"
@@ -1098,6 +1130,433 @@ def detect_upcoming_bos(df: pd.DataFrame, direction: str) -> Optional[float]:
     return None
 
 
+# ═════════════════════════════════════════════════════════════
+#  PRE-BOS INTENT DETECTOR  — v1.0
+#  Détecte l'intention institutionnelle AVANT la cassure BOS.
+#
+#  Logique : Sweep → Displacement → Micro-FVG → Momentum Shift
+#  Scoring (100 pts) :
+#    Sweep liquidité          = 30 pts
+#    Displacement ≥ ATR×1.5  = 25 pts   ← filtre anti-faux signal
+#    Micro-FVG présent        = 20 pts
+#    Momentum shift / mini-BOS= 15 pts
+#    Biais HTF aligné         = 10 pts
+#  Trade si score ≥ 70 (3 signaux sur 4 + HTF)
+# ═════════════════════════════════════════════════════════════
+
+PRE_BOS_SCORE_MIN     = 80      # seuil relevé : 70 → 80 (évite signaux faibles sans HTF)
+PRE_BOS_SWEEP_THRESH  = 0.0003  # spike min au-delà du swing (3 pips)
+PRE_BOS_DISP_ATR_MULT = 1.5     # displacement ≥ ATR × 1.5
+PRE_BOS_MICRO_FVG_MIN = 0.0001  # ratio gap minimal (plus sensible que FVG classique)
+PRE_BOS_MOM_LOOKBACK  = 6       # bougies pour détecter le mini-BOS interne
+
+
+@dataclass
+class PreBosSignal:
+    """Résultat d'une analyse Pre-BOS. Converti en Signal standard avant envoi."""
+    symbol          : str
+    direction       : str
+    score           : int
+    entry           : float
+    sl              : float
+    tp              : float
+    rr              : float
+    sweep_level     : float
+    displacement_ok : bool
+    micro_fvg_ok    : bool
+    momentum_ok     : bool
+    htf_aligned     : bool
+    timestamp       : datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    reasons         : list = field(default_factory=list)
+
+
+def _prebos_detect_sweep(df: pd.DataFrame, direction: str) -> tuple[bool, Optional[float]]:
+    """
+    Détecte un sweep de liquidité récent (stop hunt).
+
+    Seuil adaptatif : ATR × 0.2 (s'adapte automatiquement à chaque marché :
+    BTC, Forex, Gold, Indices — plus besoin de threshold fixe en pips).
+
+    BEARISH sweep :
+      wick au-dessus du swing high des 20 dernières bougies
+      + clôture EN-DESSOUS du swing high.
+
+    BULLISH sweep :
+      wick en-dessous du swing low
+      + clôture AU-DESSUS.
+
+    Retourne (sweep_ok, niveau_sweepé).
+    """
+    if len(df) < 25:
+        return False, None
+
+    atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    if atr == 0 or np.isnan(atr):
+        return False, None
+
+    # Seuil adaptatif marché (remplace PRE_BOS_SWEEP_THRESH fixe)
+    adaptive_thresh = atr * 0.20
+
+    window     = df.iloc[-25:-1]
+    swing_high = window["high"].max()
+    swing_low  = window["low"].min()
+
+    last_h = df["high"].iloc[-2]
+    last_l = df["low"].iloc[-2]
+    last_c = df["close"].iloc[-2]
+
+    if direction == "SHORT":
+        if last_h > swing_high + adaptive_thresh and last_c < swing_high:
+            return True, swing_high
+
+    elif direction == "LONG":
+        if last_l < swing_low - adaptive_thresh and last_c > swing_low:
+            return True, swing_low
+
+    return False, None
+
+
+def _prebos_detect_displacement(df: pd.DataFrame, direction: str) -> tuple[bool, float]:
+    """
+    Détecte une bougie impulsive (displacement) post-sweep.
+
+    Critères :
+      • Corps ≥ ATR × PRE_BOS_DISP_ATR_MULT (1.5×)  ← FILTRE ANTI-FAUX SIGNAL
+      • Corps ≥ 60% de la bougie totale (peu de mèches)
+      • Clôture dans le sens du move prévu
+
+    Si aucune des 3 dernières bougies clôturées ne valide → False.
+    Retourne (displacement_ok, body_size).
+    """
+    if len(df) < 16:
+        return False, 0.0
+
+    atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    if atr == 0 or np.isnan(atr):
+        return False, 0.0
+
+    for i in range(-2, -5, -1):
+        o   = df["open"].iloc[i]
+        h   = df["high"].iloc[i]
+        l   = df["low"].iloc[i]
+        cl  = df["close"].iloc[i]
+        body      = abs(cl - o)
+        candle_rng = h - l
+        if body == 0 or candle_rng == 0:
+            continue
+        # Filtre anti-faux signal (du brief) : body < ATR×1.5 → rejeté
+        if body < atr * PRE_BOS_DISP_ATR_MULT:
+            continue
+        # Ratio corps/total ≥ 60%
+        if body / candle_rng < 0.60:
+            continue
+        # Direction cohérente
+        if direction == "LONG"  and cl <= o:
+            continue
+        if direction == "SHORT" and cl >= o:
+            continue
+        return True, body
+
+    return False, 0.0
+
+
+def _prebos_detect_micro_fvg(df: pd.DataFrame, direction: str) -> Optional[dict]:
+    """
+    Détecte le micro Fair Value Gap créé par la bougie impulsive.
+    Plus sensible que le FVG classique (ratio minimal réduit).
+
+    FVG bullish : gap entre bougie[i-2].low et bougie[i].high (zone non traversée).
+    FVG bearish : gap entre bougie[i-2].high et bougie[i].low.
+
+    Retourne un dict {top, bottom, mid} ou None.
+    """
+    if len(df) < 6:
+        return None
+
+    for i in range(len(df) - 1, max(len(df) - 9, 2), -1):
+        h_prev2 = df["high"].iloc[i - 2]
+        l_prev2 = df["low"].iloc[i - 2]
+        h_curr  = df["high"].iloc[i]
+        l_curr  = df["low"].iloc[i]
+        ref     = df["close"].iloc[i]
+
+        if direction == "SHORT":
+            gap_bottom = h_prev2
+            gap_top    = l_curr
+            if gap_top > gap_bottom and ref > 0:
+                if (gap_top - gap_bottom) / ref > PRE_BOS_MICRO_FVG_MIN:
+                    return {"top": gap_top, "bottom": gap_bottom,
+                            "mid": (gap_top + gap_bottom) / 2}
+
+        elif direction == "LONG":
+            gap_top    = l_prev2
+            gap_bottom = h_curr
+            if gap_top > gap_bottom and ref > 0:
+                if (gap_top - gap_bottom) / ref > PRE_BOS_MICRO_FVG_MIN:
+                    return {"top": gap_top, "bottom": gap_bottom,
+                            "mid": (gap_top + gap_bottom) / 2}
+
+    return None
+
+
+def _prebos_detect_momentum(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Détecte un changement de momentum (mini-BOS interne).
+
+    SHORT : ≥ 2 Lower Highs consécutifs  OU  cassure d'un micro swing low.
+    LONG  : ≥ 2 Higher Lows consécutifs  OU  cassure d'un micro swing high.
+    """
+    n = PRE_BOS_MOM_LOOKBACK + 2
+    if len(df) < n + 2:
+        return False
+
+    window = df.iloc[-(n + 2):]
+    highs  = window["high"].values
+    lows   = window["low"].values
+    closes = window["close"].values
+    sz     = len(highs)
+
+    if direction == "SHORT":
+        lh_count = sum(1 for i in range(1, sz) if highs[i] < highs[i - 1])
+        if lh_count >= 2:
+            return True
+        micro_low = lows[-PRE_BOS_MOM_LOOKBACK:-2].min()
+        if closes[-1] < micro_low:
+            return True
+
+    elif direction == "LONG":
+        hl_count = sum(1 for i in range(1, sz) if lows[i] > lows[i - 1])
+        if hl_count >= 2:
+            return True
+        micro_high = highs[-PRE_BOS_MOM_LOOKBACK:-2].max()
+        if closes[-1] > micro_high:
+            return True
+
+    return False
+
+
+def _prebos_score(sweep_ok, displacement_ok, micro_fvg_ok,
+                  momentum_ok, htf_aligned) -> tuple[int, list]:
+    """Scoring Pre-BOS sur 100. Trade si ≥ 70."""
+    score, reasons = 0, []
+    if sweep_ok:
+        score += 30
+        reasons.append("🔥 Sweep de liquidité (stop hunt)  (+30)")
+    if displacement_ok:
+        score += 25
+        reasons.append("⚡ Displacement impulsif ≥ ATR×1.5  (+25)")
+    if micro_fvg_ok:
+        score += 20
+        reasons.append("📍 Micro-FVG (déséquilibre post-impulsion)  (+20)")
+    if momentum_ok:
+        score += 15
+        reasons.append("📈 Momentum shift / mini-BOS interne  (+15)")
+    if htf_aligned:
+        score += 10
+        reasons.append("✅ Biais HTF aligné  (+10)")
+    return min(score, 100), reasons
+
+
+def _prebos_levels(df: pd.DataFrame, direction: str,
+                   sweep_level: float, micro_fvg: Optional[dict],
+                   symbol: str = "") -> tuple[float, float, float, float]:
+    """
+    Calcule entry / SL / TP / RR pour un signal Pre-BOS.
+
+    ENTRÉE   → 50% du micro-FVG  (ou close si pas de FVG)
+    STOP LOSS→ au-delà du niveau sweepé + buffer défensif
+    TP       → prochaine zone de liquidité (swing H/L opposé sur 30 bougies)
+               garantit RR net ≥ 3 après spread.
+    """
+    atr    = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    close  = df["close"].iloc[-1]
+    spread = get_spread(symbol) if symbol else 0.0
+    dec    = 2 if close > 100 else 5
+
+    # Buffer SL défensif : 55% ATR minimum (était 35% → trop serré)
+    # Garantit que le bruit normal du marché ne touche pas le SL
+    buf = max(atr * 0.55, spread * 3.0)
+
+    # 1. Entrée
+    entry = round(micro_fvg["mid"] if micro_fvg else close, dec)
+
+    # 2. Stop Loss — placé au-delà du sweep avec buffer défensif réel
+    if direction == "LONG":
+        sl = round(sweep_level - buf, dec)
+    else:
+        sl = round(sweep_level + buf, dec)
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return entry, sl, entry, 0.0
+
+    # 3. Take Profit — basé sur la prochaine zone de liquidité RÉELLE
+    # On cherche les swing highs/lows sur 50 bougies (plus large = meilleur TP)
+    # On ne force JAMAIS un TP artificiel : si la liquidité est loin → RR élevé,
+    # si elle est proche et le RR < MIN_RR → signal rejeté en aval.
+    window = df.iloc[-50:]
+    if direction == "SHORT":
+        candidates = sorted([
+            window["low"].iloc[i]
+            for i in range(len(window) - 2, 0, -1)
+            if (window["low"].iloc[i] < window["low"].iloc[i - 1]
+                and window["low"].iloc[i] < window["low"].iloc[i + 1]
+                and window["low"].iloc[i] < entry - risk)  # TP doit dépasser le risk
+        ])
+        # Prend le swing low le plus proche atteignable (pas forcément le plus bas)
+        tp_nat = candidates[0] if candidates else entry - atr * 5
+        tp = round(tp_nat, dec)
+        gain = (entry - tp) - spread
+    else:
+        candidates = sorted([
+            window["high"].iloc[i]
+            for i in range(len(window) - 2, 0, -1)
+            if (window["high"].iloc[i] > window["high"].iloc[i - 1]
+                and window["high"].iloc[i] > window["high"].iloc[i + 1]
+                and window["high"].iloc[i] > entry + risk)
+        ], reverse=True)
+        tp_nat = candidates[-1] if candidates else entry + atr * 5
+        tp = round(tp_nat, dec)
+        gain = (tp - entry) - spread
+
+    # RR réel — pas de plancher artificiel, pas de plafond
+    rr = round(gain / risk, 2) if gain > 0 and risk > 0 else 0.0
+    return entry, sl, tp, rr
+
+
+def analyse_pre_bos(symbol: str, df_ltf: pd.DataFrame,
+                    df_htf: pd.DataFrame, direction: str,
+                    silent: bool = False) -> Optional[PreBosSignal]:
+    """
+    Moteur Pre-BOS : détecte l'intention institutionnelle AVANT le BOS.
+
+    Appelé depuis analyse() AVANT les filtres BOS classiques.
+    Si un signal Pre-BOS est détecté avec score ≥ 70, il est retourné
+    comme Signal standard et envoyé via tg_notify() exactement comme
+    un signal SMC classique.
+
+    Flow :
+      1. Session active ?          → sinon None
+      2. Sweep détecté ?           → sinon None  (condition sine qua non)
+      3. Displacement ≥ ATR×1.5 ? → +25 pts (filtre anti-faux signal)
+      4. Micro-FVG présent ?       → +20 pts
+      5. Momentum shift ?          → +15 pts
+      6. HTF aligné ?              → +10 pts
+      7. Score ≥ 70 ?              → signal valide
+    """
+    if df_ltf.empty or df_htf.empty or len(df_ltf) < 25:
+        return None
+
+    # ── 1. SWEEP (condition sine qua non) ─────────────────────
+    sweep_ok, sweep_level = _prebos_detect_sweep(df_ltf, direction)
+    if not sweep_ok or sweep_level is None:
+        return None
+
+    # ── 2. DISPLACEMENT ───────────────────────────────────────
+    displacement_ok, _ = _prebos_detect_displacement(df_ltf, direction)
+
+    # ── 3. MICRO-FVG ──────────────────────────────────────────
+    micro_fvg    = _prebos_detect_micro_fvg(df_ltf, direction)
+    micro_fvg_ok = micro_fvg is not None
+
+    # ── 4. MOMENTUM SHIFT ─────────────────────────────────────
+    momentum_ok = _prebos_detect_momentum(df_ltf, direction)
+
+    # ── 5. BIAIS HTF — OBLIGATOIRE (pas juste un bonus) ──────────
+    # Un Pre-BOS contre le biais HTF = trade suicidaire → rejet immédiat
+    htf_bias_val = htf_bias(df_htf)
+    htf_aligned  = (
+        (direction == "SHORT" and htf_bias_val == "BEARISH")
+        or (direction == "LONG"  and htf_bias_val == "BULLISH")
+    )
+    if not htf_aligned:
+        return None   # Contre le biais HTF → pas de signal, peu importe le score
+
+    # ── 6. SCORING ────────────────────────────────────────────
+    score, reasons = _prebos_score(
+        sweep_ok, displacement_ok, micro_fvg_ok, momentum_ok, htf_aligned
+    )
+
+    if score < PRE_BOS_SCORE_MIN:
+        return None
+
+    # ── 7. NIVEAUX ────────────────────────────────────────────
+    try:
+        entry, sl, tp, rr = _prebos_levels(
+            df_ltf, direction, sweep_level, micro_fvg, symbol
+        )
+    except Exception:
+        atr   = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
+        close = df_ltf["close"].iloc[-1]
+        dec   = 2 if close > 100 else 5
+        entry = round(micro_fvg["mid"] if micro_fvg else close, dec)
+        buf   = atr * 0.35
+        sl    = round(sweep_level + buf if direction == "SHORT" else sweep_level - buf, dec)
+        tp    = round(entry - atr * 4   if direction == "SHORT" else entry + atr * 4,   dec)
+        risk  = abs(entry - sl)
+        rr    = round(abs(tp - entry) / risk, 2) if risk > 0 else 0.0
+
+    if rr < MIN_RR:
+        return None
+
+    if not silent:
+        dec_d = 2 if entry > 100 else 5
+        print(f"\n  {c('⚡ PRE-BOS SIGNAL', 'yellow')}  →  {c(direction, 'red' if direction == 'SHORT' else 'green')}")
+        print(f"  Sweep @ {round(sweep_level, dec_d)}  |  Score {score}/100")
+        print(f"  Entry {round(entry, dec_d)}  SL {round(sl, dec_d)}  TP {round(tp, dec_d)}  RR 1:{rr}")
+
+    return PreBosSignal(
+        symbol=symbol, direction=direction, score=score,
+        entry=entry, sl=sl, tp=tp, rr=rr,
+        sweep_level=sweep_level,
+        displacement_ok=displacement_ok, micro_fvg_ok=micro_fvg_ok,
+        momentum_ok=momentum_ok, htf_aligned=htf_aligned,
+        reasons=reasons,
+    )
+
+
+def tg_format_pre_bos(sig: PreBosSignal, tier: str = "") -> str:
+    """Formate un PreBosSignal en message HTML Telegram (même style que tg_format_signal)."""
+    dir_emoji  = "🔴 SHORT" if sig.direction == "SHORT" else "🟢 LONG"
+    score_bar  = "█" * (sig.score // 10) + "░" * (10 - sig.score // 10)
+    rr_bar     = "⭐" * min(int(sig.rr), 5)
+    ts         = sig.timestamp.strftime("%d/%m/%Y %H:%M UTC")
+    dec        = 2 if sig.entry > 100 else 5
+    risk_d     = round(abs(sig.entry - sig.sl), dec)
+    gain_d     = round(abs(sig.tp - sig.entry), dec)
+    gain_usd   = round(RISK_USD * sig.rr, 2)
+    spread_d   = round(get_spread(sig.symbol), dec)
+
+    msg = (
+        f"<b>⚡ PRE-BOS SIGNAL  —  AVANT LE BOS</b>\n"
+        f"{'─'*30}\n"
+        f"<b>Marché   :</b>  <code>{sig.symbol}</code>\n"
+        f"<b>Direction:</b>  <b>{dir_emoji}</b>\n"
+        f"<b>Mode     :</b>  <i>Sweep + Impulsion (avant BOS)</i>\n"
+        f"{'─'*30}\n"
+        f"<b>📍 Entrée    :</b>  <code>{sig.entry}</code>  ← 50% Micro-FVG\n"
+        f"<b>🔴 Stop Loss :</b>  <code>{sig.sl}</code>   <i>(risk {risk_d})</i>\n"
+        f"<b>🟢 Take Profit:</b> <code>{sig.tp}</code>   <i>(gain brut {gain_d})</i>\n"
+        f"<b>📊 Spread    :</b>  <code>{spread_d}</code>\n"
+        f"<b>⚖  R : R net :</b>  <b>1 : {sig.rr}</b>  {rr_bar}\n"
+        f"{'─'*30}\n"
+        f"<b>🎯 Sweep @  :</b>  <code>{sig.sweep_level}</code>\n"
+        f"<b>💰 Risque   :</b>  ${RISK_USD}  →  gain ≈ <b>${gain_usd}</b>\n"
+        f"<b>Score :</b>  [{score_bar}]  {sig.score}/100\n"
+        f"<b>Confluence :</b>\n"
+    )
+    for r in sig.reasons:
+        msg += f"  • {r}\n"
+    msg += (
+        f"{'─'*30}\n"
+        f"<i>⚠ Attends le retour sur le micro-FVG — PAS d'entrée au marché</i>\n"
+        f"<i>🕐 {ts}</i>"
+    )
+    return msg
+
+
+# ─── FIN PRE-BOS INTENT DETECTOR ────────────────────────────
+
 # ─────────────────────────────────────────────────────────────
 #  VÉRIFICATION FVG ACTIF (prix dans la zone)
 # ─────────────────────────────────────────────────────────────
@@ -1268,28 +1727,46 @@ def compute_sl_tp(
     else:
         entry   = round(close, dec)
 
-    # ── 2. STOP LOSS (bord OB + petit buffer ATR) ────────────
-    buf = atr * 0.25
+    # ── 2. STOP LOSS (bord OB + buffer défensif réel) ────────────
+    # buf = max(55% ATR, 3× spread) — protège contre le bruit normal
+    # Était 40% ATR → trop serré, prix touchait le SL avant le TP
+    buf = max(atr * 0.55, spread * 3.0)
     if direction == "LONG":
-        sl = round((ob.bottom - buf) if ob else (entry - atr * 1.5), dec)
+        sl = round((ob.bottom - buf) if ob else (entry - atr * 1.8), dec)
     else:
-        sl = round((ob.top    + buf) if ob else (entry + atr * 1.5), dec)
+        sl = round((ob.top    + buf) if ob else (entry + atr * 1.8), dec)
 
     risk = round(abs(entry - sl), dec + 2)
     if risk <= 0:
         return entry, sl, entry, 0.0
 
-    # ── 3. TAKE PROFIT ───────────────────────────────────────
-    # TP minimal pour RR net = min_rr exactement après spread
+    # ── 3. TAKE PROFIT — basé sur la liquidité réelle (50 bougies) ──
+    # Logique : cherche le prochain swing H/L non cassé comme cible naturelle.
+    # On ne force PLUS de TP minimal artificiel (tp_rr_net supprimé).
+    # Si la liquidité est loin → RR élevé (4, 5, 6...) → c'est bien.
+    # Si la liquidité est trop proche → RR < min_rr → signal rejeté en aval.
+    window50 = df.iloc[-50:]
     if direction == "LONG":
-        tp_rr_net = entry + risk * min_rr + spread   # garanti RR net = min_rr
-        tp_atr    = entry + atr * 4.0                # TP naturel ATR × 4
-        tp = round(max(tp_rr_net, tp_atr), dec)      # prend le plus favorable (plus haut)
+        tp_candidates = sorted([
+            window50["high"].iloc[i]
+            for i in range(len(window50) - 2, 0, -1)
+            if (window50["high"].iloc[i] > window50["high"].iloc[i - 1]
+                and window50["high"].iloc[i] > window50["high"].iloc[i + 1]
+                and window50["high"].iloc[i] > entry + risk)
+        ], reverse=True)
+        tp_nat = tp_candidates[-1] if tp_candidates else entry + atr * 5
+        tp = round(max(tp_nat, entry + atr * 4), dec)
         gain_net = (tp - entry) - spread
     else:
-        tp_rr_net = entry - risk * min_rr - spread
-        tp_atr    = entry - atr * 4.0
-        tp = round(min(tp_rr_net, tp_atr), dec)      # plus bas = plus favorable SHORT
+        tp_candidates = sorted([
+            window50["low"].iloc[i]
+            for i in range(len(window50) - 2, 0, -1)
+            if (window50["low"].iloc[i] < window50["low"].iloc[i - 1]
+                and window50["low"].iloc[i] < window50["low"].iloc[i + 1]
+                and window50["low"].iloc[i] < entry - risk)
+        ])
+        tp_nat = tp_candidates[0] if tp_candidates else entry - atr * 5
+        tp = round(min(tp_nat, entry - atr * 4), dec)
         gain_net = (entry - tp) - spread
 
     # ── 4. RR net réel (recalculé sur le TP final) ───────────
@@ -1392,6 +1869,35 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         if not silent:
             print(c("  ✗ Biais NEUTRAL — signal ignoré.", "yellow"))
         return None
+
+    # ══════════════════════════════════════════════════════════
+    #  PRE-BOS CHECK — Détection AVANT la cassure BOS
+    #  Lancé en premier pour capter les setups précoces.
+    #  Si un Pre-BOS est validé (score >= 70) ET que les filtres
+    #  principaux (RR, daily limit, cooldown) passent,
+    #  on retourne directement ce signal sans attendre le BOS.
+    # ══════════════════════════════════════════════════════════
+    pre_bos = analyse_pre_bos(symbol, df_ltf, df_htf, direction, silent=True)
+    if pre_bos is not None:
+        if not silent:
+            print(c(f"\n  PRE-BOS detecte  score={pre_bos.score}/100  "
+                    f"RR=1:{pre_bos.rr}  sweep@{round(pre_bos.sweep_level,5)}", "yellow"))
+        lot_pb = compute_lot(symbol, pre_bos.entry, pre_bos.sl)
+        pre_bos_signal = Signal(
+            symbol    = pre_bos.symbol,
+            direction = pre_bos.direction,
+            entry     = pre_bos.entry,
+            sl        = pre_bos.sl,
+            tp        = pre_bos.tp,
+            rr        = pre_bos.rr,
+            score     = pre_bos.score,
+            timestamp = pre_bos.timestamp,
+            htf_bias  = bias,
+            lot       = lot_pb,
+            risk_usd  = RISK_USD,
+            reasons   = pre_bos.reasons,
+        )
+        return pre_bos_signal
 
     # ── M15 : Structure intermédiaire ────────────────────────
     bos_mtf = detect_bos(df_mtf)
@@ -1496,6 +2002,84 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
         sc  = "green" if score >= 80 else ("yellow" if score >= 60 else "red")
         print(f"\n  Score  [{c(bar, sc)}]  {c(str(score) + '/100', sc)}")
+
+    # ══════════════════════════════════════════════════════════
+    #  FILTRE CRITIQUE — PRIX DANS LA ZONE D'ENTRÉE M15
+    #
+    #  Règle : le signal n'est valide que si le prix actuel est
+    #  physiquement DANS une zone structurelle M15 :
+    #    • OB M15 aligné avec le biais  (priorité 1)
+    #    • FVG M5 actif non mitiqué     (priorité 2)
+    #    • Zone Fibonacci 61.8% du range M15 (retracement 0.5–0.786)
+    #
+    #  Si aucune condition n'est remplie → signal rejeté.
+    #  C'est le filtre qui empêche les entrées "dans le vide".
+    # ══════════════════════════════════════════════════════════
+    price_now_check = df_ltf["close"].iloc[-1]
+
+    # ── Zone OB M15 ──────────────────────────────────────────
+    in_ob_m15 = False
+    if ob_mtf_match is not None:
+        ob_lo = min(ob_mtf_match.top, ob_mtf_match.bottom)
+        ob_hi = max(ob_mtf_match.top, ob_mtf_match.bottom)
+        # Tolérance : ±10% de la hauteur de l'OB (pour pin bars qui effleurent)
+        tolerance = (ob_hi - ob_lo) * 0.10
+        in_ob_m15 = (ob_lo - tolerance) <= price_now_check <= (ob_hi + tolerance)
+
+    # ── Zone FVG M5 actif ─────────────────────────────────────
+    in_fvg_m5 = False
+    if fvg_active is not None:
+        fvg_lo = min(fvg_active.top, fvg_active.bottom)
+        fvg_hi = max(fvg_active.top, fvg_active.bottom)
+        in_fvg_m5 = fvg_lo <= price_now_check <= fvg_hi
+
+    # ── Zone Fibonacci 50%–78.6% du range M15 ────────────────
+    # Retracement de Fibonacci sur les 50 dernières bougies M15
+    # Cherche le dernier swing significatif opposé au biais
+    in_fib_zone = False
+    if len(df_mtf) >= 20:
+        mtf_window = df_mtf.iloc[-50:]
+        if direction == "SHORT":
+            # Pour un SHORT : swing high récent → retracement haussier → zone SHORT
+            swing_hi = mtf_window["high"].max()
+            swing_lo = mtf_window["low"].min()
+            # Zone 50%–78.6% = prix entre 50% et 78.6% du mouvement haussier
+            fib_50   = swing_hi - (swing_hi - swing_lo) * 0.500
+            fib_786  = swing_hi - (swing_hi - swing_lo) * 0.214   # 100-78.6=21.4%
+            in_fib_zone = fib_50 <= price_now_check <= fib_786
+        else:
+            # Pour un LONG : swing low récent → retracement baissier → zone LONG
+            swing_hi = mtf_window["high"].max()
+            swing_lo = mtf_window["low"].min()
+            fib_50   = swing_lo + (swing_hi - swing_lo) * 0.500
+            fib_786  = swing_lo + (swing_hi - swing_lo) * 0.786
+            in_fib_zone = fib_50 <= price_now_check <= fib_786
+
+    # ── Décision finale : au moins UNE zone doit être validée ─
+    price_in_valid_zone = in_ob_m15 or in_fvg_m5 or in_fib_zone
+
+    if not silent:
+        print(f"\n  {c('── Filtre Zone Entrée M15 ──', 'cyan')}")
+        print(f"  {'Prix dans OB M15':<30} {tick(in_ob_m15)}")
+        print(f"  {'Prix dans FVG M5 actif':<30} {tick(in_fvg_m5)}")
+        print(f"  {'Prix dans zone Fibo 50–78.6%':<30} {tick(in_fib_zone)}")
+        zone_color = "green" if price_in_valid_zone else "red"
+        print(f"  {'→ Zone valide':<30} {c('OUI ✓' if price_in_valid_zone else 'NON ✗ — signal rejeté', zone_color)}")
+
+    if not price_in_valid_zone:
+        if not silent:
+            print(c("\n  ✗ Prix hors zone structurelle M15 — signal rejeté.", "red"))
+            print(c("    (OB M15 / FVG M5 / Fibonacci 50–78.6% requis)", "yellow"))
+        return None
+
+    # ── Bonus score confluence de zones ──────────────────────
+    zone_count = sum([in_ob_m15, in_fvg_m5, in_fib_zone])
+    if zone_count >= 2:
+        score = min(score + 5, 100)
+        reasons.append(f"📐 Double confluence zone ({zone_count}/3)  (+5)")
+    if zone_count == 3:
+        score = min(score + 5, 100)
+        reasons.append("🎯 Triple confluence zone (OB + FVG + Fibo)  (+5)")
 
     # ── Filtre score ─────────────────────────────────────────
     if score < SCORE_THRESHOLD:
@@ -2166,9 +2750,22 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
             now_hhmm = now_utc.strftime("%H:%M UTC")
 
+            # ── Hors session → pause + heartbeat toutes les 5 min ──
+            if not is_session_active():
+                # Log toutes les 10 cycles (~5 min) pour confirmer que le script tourne
+                if cycle_n % 10 == 1:
+                    log.info(f"  💤 [{cycle_n}] {now_hhmm} — Hors session (London 07-10 / NY 13-16 UTC) — Script actif ✓")
+                with _STATUS_LOCK:
+                    _STATUS["cycle"]     = cycle_n
+                    _STATUS["last_scan"] = now_str
+                    _STATUS["scan_running"] = False
+                time.sleep(interval)
+                continue
+
             with _STATUS_LOCK:
-                _STATUS["cycle"]     = cycle_n
-                _STATUS["last_scan"] = now_str
+                _STATUS["scan_running"] = True
+                _STATUS["cycle"]        = cycle_n
+                _STATUS["last_scan"]    = now_str
 
             log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols)} paires")
 
@@ -2325,6 +2922,10 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
                         "rr"       : sig.rr,
                         "score"    : sig.score,
                         "lot"      : sig.lot,
+                        "mode"     : ("PRE-BOS"
+                                      if any("Sweep" in r or "sweep" in r
+                                             for r in sig.reasons)
+                                      else "SMC"),
                     })
                     # Garde seulement les 50 derniers signaux
                     _STATUS["last_signals"] = _STATUS["last_signals"][-50:]
@@ -2393,6 +2994,9 @@ if __name__ == "__main__":
     #    fasse son port-scan (évite "No open ports detected")
     time.sleep(3)
     log.info(f"  ✓ Flask dashboard actif sur le port {flask_port}")
+
+    # ── Self-ping anti-veille Render (plan gratuit) ────────────
+    start_self_ping(flask_port)
 
     # ── Mode selon les arguments ────────────────────────────────
     if args.symbol:
