@@ -1,4 +1,3 @@
-
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║          SMC SIGNAL ENGINE  v2  — Smart Money Concepts              ║
@@ -166,9 +165,7 @@ except ImportError:
 DEFAULT_SYMBOL  = "GBPUSD=X"
 HTF             = "1h"     # Biais directionnel
 MTF             = "15m"    # Confirmation structure (BOS + OB)
-MTF2            = "30m"    # FVG intermédiaire (équivalent 45min — yfinance ne supporte pas 45m)
-LTF             = "5m"     # Entrée précise (FVG + bougie confirmation)
-ENTRY_TF        = "1m"     # Trigger final optionnel (confirmation M1)
+LTF             = "5m"     # Entrée précise (FVG M5 + OB M5)
 
 FVG_MIN_RATIO   = 0.0002   # FVG plus sensible sur M5/M1
 OB_LOOKBACK     = 5
@@ -176,6 +173,97 @@ LIQ_THRESHOLD   = 0.0004
 SCORE_THRESHOLD = 80       # Seuil élevé → signaux élite uniquement
 MIN_RR          = 3.0      # RR net spread minimum — M5 entry
 RISK_USD        = 25.0     # Risque fixe par position en USD
+
+# ─────────────────────────────────────────────────────────────
+#  FILTRES VOLATILITÉ — marchés morts exclus automatiquement
+# ─────────────────────────────────────────────────────────────
+# ATR M5 minimum par paire (en prix brut).
+# Si l'ATR M5 est sous ce seuil → marché trop plat → skip.
+# Calibré pour que risk × 3 + spread soit atteignable en M5/M15.
+ATR_MIN: dict[str, float] = {
+    # Forex majeures
+    "EURUSD=X": 0.00060,   # 6 pips min
+    "GBPUSD=X": 0.00080,   # 8 pips
+    "USDJPY=X": 0.080,     # 8 pips JPY
+    "USDCHF=X": 0.00060,
+    "AUDUSD=X": 0.00055,
+    "NZDUSD=X": 0.00050,
+    "USDCAD=X": 0.00060,
+    # Croisées — plus larges
+    "GBPJPY=X": 0.120,
+    "EURJPY=X": 0.090,
+    "GBPAUD=X": 0.00110,
+    "GBPCAD=X": 0.00110,
+    "GBPNZD=X": 0.00130,
+    "EURGBP=X": 0.00045,
+    "EURAUD=X": 0.00090,
+    "EURCAD=X": 0.00090,
+    "AUDJPY=X": 0.070,
+    "CADJPY=X": 0.070,
+    "CHFJPY=X": 0.080,
+    "NZDJPY=X": 0.065,
+    # Gold / Silver
+    "GC=F":     1.50,      # $1.5/oz min
+    "SI=F":     0.05,
+    # Pétrole
+    "CL=F":     0.30,
+    "BZ=F":     0.30,
+    # Crypto
+    "BTC-USD":  200.0,
+    "ETH-USD":  10.0,
+    # Indices
+    "^GSPC":    8.0,
+    "^NDX":     30.0,
+    "^DJI":     80.0,
+    "^GDAXI":   40.0,
+}
+ATR_MIN_DEFAULT = 0.00050  # fallback pour symboles non listés
+
+# Sessions actives UTC — on ne scanne que London + NY
+# London  : 07:00 → 16:00 UTC
+# New York: 12:00 → 21:00 UTC
+# Overlap : 12:00 → 16:00 UTC (meilleure liquidité)
+SESSION_START_UTC = 7    # heure ouverture London
+SESSION_END_UTC   = 21   # heure fermeture NY
+
+# Ratio spread/ATR max — si spread > X% de l'ATR → skip (RR impossible)
+MAX_SPREAD_ATR_RATIO = 0.25   # spread ne doit pas dépasser 25% de l'ATR M5
+
+
+def is_session_active() -> bool:
+    """Retourne True si on est dans London ou NY session (UTC)."""
+    hour = datetime.now(timezone.utc).hour
+    return SESSION_START_UTC <= hour < SESSION_END_UTC
+
+
+def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Vérifie si le marché est suffisamment volatil pour trader.
+    Retourne (ok, raison_si_rejeté).
+
+    Critères :
+      1. ATR M5 ≥ seuil minimum du symbole
+      2. Spread ≤ 25% de l'ATR (RR 3 mathématiquement atteignable)
+      3. Session active (London ou NY)
+    """
+    if df_ltf.empty or len(df_ltf) < 14:
+        return False, "données insuffisantes"
+
+    atr = (df_ltf["high"] - df_ltf["low"]).rolling(14).mean().iloc[-1]
+    atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT)
+    spread  = get_spread(symbol)
+
+    if atr < atr_min:
+        return False, f"ATR trop faible ({round(atr, 5)} < {atr_min})"
+
+    ratio = spread / atr if atr > 0 else 1.0
+    if ratio > MAX_SPREAD_ATR_RATIO:
+        return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
+
+    if not is_session_active():
+        return False, "hors session (London/NY)"
+
+    return True, ""
 
 # ─────────────────────────────────────────────────────────────
 #  SPREADS TYPIQUES PAR INSTRUMENT  (en prix brut, pas en pips)
@@ -1165,28 +1253,32 @@ def detect_confirmation_candle(df: pd.DataFrame, direction: str) -> bool:
 # ─────────────────────────────────────────────────────────────
 def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             silent: bool = False) -> Optional[Signal]:
-    mtf = MTF   # M15 intermédiaire
-    etf = ENTRY_TF  # M1 trigger
+    mtf = MTF   # M15 confirmation structure
 
     if not silent:
         print(f"\n{c('═'*60, 'cyan')}")
-        print(f"  {c('SMC 3-TF ENGINE', 'yellow')}  —  {c(symbol, 'white')}  "
+        print(f"  {c('SMC ENGINE', 'yellow')}  —  {c(symbol, 'white')}  "
               f"{c(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'cyan')}")
-        print(f"  {c(f'H1 → {mtf} → {ltf}/M1', 'cyan')}")
+        print(f"  {c(f'H1 → {mtf} → {ltf}', 'cyan')}")
         print(c("═" * 60, "cyan"))
 
-    # ── Téléchargement 5 TF (H1 / 30m / M15 / M5 / M1) ────────
+    # ── Téléchargement 3 TF uniquement : H1 / M15 / M5 ─────────
     if not silent:
-        print(f"  {c('↓', 'cyan')} Data  {htf} / 30m / {mtf} / {ltf} / {etf} …")
-    df_htf  = fetch(symbol, htf,   period="10d")
-    df_30m  = fetch(symbol, MTF2,  period="5d")   # 30min ≈ 45MIN FVG
-    df_mtf  = fetch(symbol, mtf,   period="5d")
-    df_ltf  = fetch(symbol, ltf,   period="2d")
-    df_etf  = fetch(symbol, etf,   period="1d")
+        print(f"  {c('↓', 'cyan')} Data  {htf} / {mtf} / {ltf} …")
+    df_htf = fetch(symbol, htf, period="10d")
+    df_mtf = fetch(symbol, mtf, period="5d")
+    df_ltf = fetch(symbol, ltf, period="2d")
 
     if df_htf.empty or df_mtf.empty or df_ltf.empty:
         if not silent:
             print(c("  ✗ Données indisponibles.", "red"))
+        return None
+
+    # ── FILTRES VOLATILITÉ — skip si marché mort ─────────────
+    vol_ok, vol_reason = check_volatility(symbol, df_ltf)
+    if not vol_ok:
+        if not silent:
+            print(c(f"  ⛔ Marché ignoré : {vol_reason}", "yellow"))
         return None
 
     # ── H1 : Biais directionnel ──────────────────────────────
@@ -1233,35 +1325,23 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     # ── Bougie de confirmation M5 ────────────────────────────
     ltf_confirm = detect_confirmation_candle(df_ltf, direction)
 
-    # ── M1 : Trigger final ───────────────────────────────────
-    entry_m1 = False
-    if not df_etf.empty:
-        fvgs_m1  = detect_fvg(df_etf)
-        fvg_m1   = active_fvg(df_etf, fvgs_m1, bias.lower())
-        m1_cnf   = detect_confirmation_candle(df_etf, direction)
-        entry_m1 = (fvg_m1 is not None) or m1_cnf
-
     # ══════════════════════════════════════════════════════════
-    #  SETUPS AVANCÉS — intégrés depuis charts BTC + EUR/USD
+    #  SETUPS AVANCÉS — M15
     # ══════════════════════════════════════════════════════════
 
-    # Breaker Block sur M15 (OB mitiqué flipé — setup BTC chart)
-    bkr_mtf    = detect_breaker_blocks(df_mtf, bos_mtf)
-    breaker_block = any(b["direction"] == bias.lower() for b in bkr_mtf)
+    # Breaker Block sur M15
+    bkr_mtf       = detect_breaker_blocks(df_mtf, bos_mtf)
+    breaker_block  = any(b["direction"] == bias.lower() for b in bkr_mtf)
 
-    # FVG 30min actif (équivalent 45MIN FVG — chart BTC)
-    fvg_30m_active = detect_fvg_30m(df_30m, bias.lower()) if not df_30m.empty else None
-    fvg_30m    = fvg_30m_active is not None
-
-    # FVG Valid non mitiqué sur M5 (chart EUR/USD — 'Valid FVG')
+    # FVG Valid non mitiqué sur M5
     fvg_unmitigated = False
     if fvg_active is not None:
         fvg_unmitigated = is_fvg_unmitigated(df_ltf, fvg_active)
 
-    # Trendline Liquidity sweepée sur M15 (chart EUR/USD)
+    # Trendline Liquidity sweepée sur M15
     trendline_liq = detect_trendline_liquidity(df_mtf, bias.lower())
 
-    # Older Block HTF = OB H1 actif sur la zone actuelle (chart EUR/USD)
+    # Older Block HTF = OB H1 actif sur la zone actuelle
     bos_htf    = detect_bos(df_htf)
     obs_htf    = detect_order_blocks(df_htf, bos_htf)
     price_now  = df_ltf["close"].iloc[-1]
@@ -1271,7 +1351,7 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         for o in obs_htf
     )
 
-    # Upcoming BOS comme niveau TP additionnel (chart EUR/USD)
+    # Upcoming BOS comme niveau TP additionnel
     upcoming_bos = detect_upcoming_bos(df_mtf, direction)
 
     # ── Score multi-TF + setups avancés ──────────────────────
@@ -1286,9 +1366,9 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         mtf_ob           = mtf_ob,
         ltf_fvg          = ltf_fvg,
         ltf_confirm      = ltf_confirm,
-        entry_m1         = entry_m1,
+        entry_m1         = False,        # M1 désactivé — entrée M5
         breaker_block    = breaker_block,
-        fvg_30m          = fvg_30m,
+        fvg_30m          = False,        # 30m désactivé — 3 TF seulement
         fvg_unmitigated  = fvg_unmitigated,
         trendline_liq    = trendline_liq,
         older_block      = older_block,
@@ -2032,20 +2112,25 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
                         _last_bias[sym] = new_bias
 
                     if sig is None:
-                        # Pas de setup — on récupère quand même le prix pour info
+                        # Pas de setup — récupère le prix + raison si dispo
                         try:
                             df_peek = fetch(sym, LTF, period="1d")
                             if not df_peek.empty:
                                 px   = df_peek["close"].iloc[-1]
                                 dec  = 2 if px > 100 else 5
                                 px_s = str(round(px, dec))
+                                # Vérifie rapidement si rejet volatilité
+                                vol_ok, vol_reason = check_volatility(sym, df_peek)
+                                skip_label = f"⛔ {vol_reason}" if not vol_ok else "⚪ Pas de setup"
                             else:
                                 px_s = "—"
+                                skip_label = "⚪ Pas de setup"
                         except Exception:
                             px_s = "—"
+                            skip_label = "⚪ Pas de setup"
                         print(f"\r{prefix}  {px_s:>14}  {'—':>7}  "
                               f"{'—':>4} {'—':>4} {'—':>4} {'—':>4}"
-                              f"  {'—':>6}  {'—':>6}  ⚪ Pas de setup")
+                              f"  {'—':>6}  {'—':>6}  {skip_label}")
 
                     else:
                         # Signal calculé — affichage détaillé
@@ -2095,6 +2180,11 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
             # ── Séparateur + résumé ────────────────────────────
             print(f"  {'─'*88}")
+
+            # ── Cap : 2 meilleurs signaux par cycle (évite le flood) ──
+            if len(signals_found) > 2:
+                signals_found = sorted(signals_found, key=lambda x: x[2].score, reverse=True)[:2]
+                print(c("  ⚠ Plus de 2 signaux — seuls les 2 meilleurs scores retenus.", "yellow"))
 
             if signals_found:
                 print(c(f"\n  ⚡ {len(signals_found)} SIGNAL(S) VALIDÉ(S) — "
@@ -2214,4 +2304,5 @@ if __name__ == "__main__":
             min_rr    = args.min_rr,
             interval  = args.interval,
         )
+
 
