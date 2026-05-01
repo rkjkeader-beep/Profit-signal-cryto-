@@ -1,30 +1,70 @@
-
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║          SMC SIGNAL ENGINE  v2  — Smart Money Concepts              ║
-║   BOS · FVG · Order Block · Liquidity · Multi-TF · 50+ Markets      ║
+║          SMC SIGNAL ENGINE  v8  — Smart Money Concepts PRO          ║
+║   BOS · FVG · Order Block · Liquidity · H1→M15→M5 · Agent IA log   ║
 ║                                                                      ║
-║   FOREX  |  INDICES  |  CRYPTO  |  COMMODITIES  |  MATIÈRES 1ÈRES   ║
+║   FOREX  |  INDICES  |  CRYPTO  |  COMMODITIES  |  MATIERES 1ERES   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-Marchés couverts :
-  FOREX      — 28 paires majeures + mineures + exotiques
-  CRYPTO     — BTC, ETH, XRP, SOL, BNB, DOGE, ADA, AVAX, LTC, LINK
-  INDICES    — SPX, NAS, DAX, CAC, FTSE, Nikkei, HSI
-  COMMODITÉS — Gold, Silver, Oil WTI, Oil Brent, Gaz Naturel, Cuivre
+Nouveautes v8 — LOGIQUE INSTITUTIONNELLE REELLE :
 
-Installation :
-    pip install yfinance pandas numpy colorama tabulate
+  ARCHITECTURE TRIPOLAIRE (H1 → M15 → M5) :
+    H1  → BIAIS directionnel (macro)
+    M15 → ZONE institutionnelle (OB / FVG / Liquidity) — confirmation OBLIGATOIRE
+    M5  → TRIGGER d'entrée précis — OBLIGATOIRE (bloque si absent)
 
-Usage :
-    python smc_signals.py                         # scan complet
-    python smc_signals.py --cat forex             # seulement forex
-    python smc_signals.py --cat crypto            # seulement crypto
-    python smc_signals.py --cat commodities       # gold/pétrole/...
-    python smc_signals.py --symbol EURUSD=X       # symbol unique
-    python smc_signals.py --live                  # boucle continue
-    python smc_signals.py --htf 4h --ltf 1h       # timeframes perso
-    python smc_signals.py --min-score 80          # filtre score élevé
+  FILTRE MARCHE (NOUVEAU) :
+    market_condition() → détecte TREND vs RANGE sur M15
+    • En RANGE : OB bloqués, seuls les sweeps de range extrêmes autorisés
+    • En TREND  : pipeline complet actif
+
+  ZONE FRAÎCHE OBLIGATOIRE (NOUVEAU) :
+    is_zone_fresh() → vérifie que le prix n'a PAS déjà traversé la zone
+    • OB mitiqué = zone invalidée → signal rejeté
+    • FVG déjà traversé = zone morte → ignoré
+
+  M5 TRIGGER OBLIGATOIRE (NOUVEAU) :
+    Le signal M15 seul ne suffit plus.
+    Entrée = close bougie M5 confirmée OU rejet immédiat.
+    Bonus score +10 si M5 trigger aligné avec M15 structure.
+
+  PATTERNS DE CONFIRMATION — 10 patterns institutionnels :
+    M15 (zone) + M5 (trigger) :
+      1.  Bullish / Bearish Engulfing (corps x1.3 minimum)
+      2.  Morning Star / Evening Star (3 bougies, recupere 50% B-2)
+      3.  Pin Bar de rejet (meche 2.5x corps, corps dans 1/3 oppose)
+      4.  Dragonfly / Gravestone Doji (corps < 5% range)
+      5.  Tweezer Bottom / Top (double test, tolerance ATR x0.2)
+      6.  Three White Soldiers / Three Black Crows (3 bougies solides)
+      7.  Hammer / Hanging Man (corps compact + meche 2x)
+      8.  Shooting Star / Inverted Hammer (meche 3x corps)
+      9.  Harami (corps interne a la bougie precedente)
+     10.  Inside Bar Break (compression puis expansion)
+
+  SESSIONS ET ANTI-MANIPULATION :
+    Fenetres autorisees : London 07-10h UTC, NY 13-17h UTC
+    Bloquees : pre-London, mid-London dull, post-NY, Asie, nuit
+    Fenetres news : avertissement ⚠ dans signal Telegram (non bloquant)
+
+  RR MINIMUM : 3.0 (filtre elite inchange)
+  SCORE MINIMUM : 80/100
+
+  Marchés couverts :
+    FOREX      — 28 paires majeures + mineures + exotiques
+    CRYPTO     — BTC, ETH, XRP, SOL, BNB, DOGE, ADA, AVAX, LTC, LINK
+    INDICES    — SPX, NAS, DAX, CAC, FTSE, Nikkei, HSI
+    COMMODITÉS — Gold, Silver, Oil WTI, Oil Brent, Gaz Naturel, Cuivre
+
+  Installation :
+    pip install yfinance pandas numpy colorama tabulate flask requests
+
+  Usage :
+    python smc_signals_v8.py                       # scan complet
+    python smc_signals_v8.py --cat forex           # seulement forex
+    python smc_signals_v8.py --cat crypto          # seulement crypto
+    python smc_signals_v8.py --cat commodities     # gold/pétrole/...
+    python smc_signals_v8.py --symbol EURUSD=X     # symbol unique
+    python smc_signals_v8.py --min-score 80        # filtre score élevé
 """
 
 import argparse
@@ -139,7 +179,8 @@ def index():
     <tr><td>Score minimum</td><td>{SCORE_THRESHOLD}/100</td></tr>
     <tr><td>RR minimum</td><td>1:{MIN_RR}</td></tr>
     <tr><td>Risque par trade</td><td>${RISK_USD}</td></tr>
-    <tr><td>Timeframes</td><td>H1 → M15 → M5 / M1</td></tr>
+    <tr><td>Timeframes</td><td>H1 biais → M15 zone → M5 trigger obligatoire (v8)</td></tr>
+    <tr><td>Agent IA Claude</td><td>{'✅ Actif' if AI_VERIFY_ENABLED and ANTHROPIC_API_KEY else '⚠️ Désactivé (clé API manquante)' if AI_VERIFY_ENABLED else '⏸ Désactivé (mode test)'}</td></tr>
     <tr><td>Intervalle scan</td><td>30 secondes</td></tr>
   </table>
 </body>
@@ -197,14 +238,26 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────
 DEFAULT_SYMBOL  = "GBPUSD=X"
 HTF             = "1h"     # Biais directionnel
-MTF             = "15m"    # Confirmation structure (BOS + OB)
-LTF             = "5m"     # Entrée précise (FVG M5 + OB M5)
+LTF             = "15m"    # Zone institutionnelle (OB / FVG / Liquidity)
+MTF_M5          = "5m"     # Trigger d'entrée précis — OBLIGATOIRE en v8
+# ─── NOTE v8 ─────────────────────────────────────────────────
+# Architecture tripolaire RÉELLE :
+#   H1  → BIAIS macro directionnel
+#   M15 → ZONE institutionnelle (OB / FVG / Liquidity sweep)
+#   M5  → TRIGGER obligatoire — sans trigger M5, pas de signal
+# ─────────────────────────────────────────────────────────────
+
+# ── Agent IA Claude — DÉSACTIVÉ en v8 ───────────────────────
+# L'agent IA Anthropic est retiré du pipeline de validation.
+# Le score SMC (≥80) + RR (≥3.0) + trigger M5 sont les seuls juges.
+ANTHROPIC_API_KEY = ""          # Non utilisé en v8
+AI_VERIFY_ENABLED = False       # Désactivé définitivement
 
 FVG_MIN_RATIO   = 0.0002   # FVG plus sensible sur M5/M1
 OB_LOOKBACK     = 5
 LIQ_THRESHOLD   = 0.0004
 SCORE_THRESHOLD = 80       # Seuil élevé → signaux élite uniquement
-MIN_RR          = 2.0      # RR net spread minimum — abaissé pour plus de trades
+MIN_RR          = 3.0      # RR net spread minimum — élite uniquement
 RISK_USD        = 25.0     # Risque fixe par position en USD
 
 # ─────────────────────────────────────────────────────────────
@@ -253,35 +306,73 @@ ATR_MIN: dict[str, float] = {
 ATR_MIN_DEFAULT = 0.00050  # fallback pour symboles non listés
 
 # ─────────────────────────────────────────────────────────────
-#  SESSIONS ACTIVES (UTC) — fenêtres de liquidité réelle uniquement
+#  SESSIONS — SCAN 07h–17h UTC (fenetre large)
 #
-#  London open   : 07:00 → 10:00 UTC  (run initial + vraie liquidité)
-#  NY open       : 13:00 → 16:00 UTC  (US session + overlap London)
+#  Le bot scanne de 07h à 17h UTC sans interruption.
+#  Londres + NY couverts. Pas de blocage mid-session.
 #
-#  Exclus intentionnellement :
-#    03:00–07:00 UTC  → Asia late / pre-London  : manipulation, faible volume
-#    10:00–13:00 UTC  → Mid-London dull zone     : range comprimé
-#    16:00–21:00 UTC  → NY post-open / fin NY    : fades & consolidation
-#    21:00–03:00 UTC  → Asie early / nuit        : marché mort
+#  HEURES SENSIBLES — signal envoyé AVEC avertissement :
+#    08:30–09:00 UTC  → NFP / CPI UK  (spike possible)
+#    10:00–13:00 UTC  → Mid-London dull zone  (faible volume)
+#    13:30–14:00 UTC  → NFP / CPI / PPI US  (spike possible)
+#    15:00–15:30 UTC  → FOMC / ISM  (spike possible)
+#
+#  Ces fenêtres ne bloquent PAS le signal — elles ajoutent
+#  un panneau ⚠️ visible dans le message Telegram.
 # ─────────────────────────────────────────────────────────────
-SESSION_WINDOWS_UTC: list[tuple[int, int]] = [
-    (7,  10),   # London open
-    (13, 16),   # NY open + overlap
+SESSION_START_UTC = 7    # 07:00 UTC
+SESSION_END_UTC   = 17   # 17:00 UTC
+
+# Fenêtres sensibles — WARNING dans le signal, pas de blocage
+# Format : (h_debut, m_debut, h_fin, m_fin, label)
+SENSITIVE_WINDOWS_UTC: list[tuple[int, int, int, int, str]] = [
+    (8,  30, 9,  0,  "NFP / CPI UK"),
+    (10,  0, 13,  0, "Mid-London dull zone (faible volume)"),
+    (13, 30, 14,  0, "NFP / CPI / PPI US"),
+    (15,  0, 15, 30, "FOMC / ISM"),
 ]
 
-# Ratio spread/ATR max — si spread > X% de l'ATR → skip (RR impossible)
-MAX_SPREAD_ATR_RATIO = 0.25   # spread ne doit pas dépasser 25% de l'ATR M5
+# Ratio spread/ATR max
+MAX_SPREAD_ATR_RATIO = 0.25
 
 
-def is_session_active() -> bool:
+def is_session_active(symbol: str = "") -> bool:
     """
-    Retourne True uniquement pendant les fenêtres haute-liquidité :
-      London open  07:00–10:00 UTC
-      NY open      13:00–16:00 UTC
-    Tout le reste (pre-London, mid-London dull, post-NY, Asia) → False.
+    Retourne True si le scan est autorisé pour ce symbole.
+
+    ─ Forex / Indices / Commodités :
+        Actif entre 07h et 17h UTC (London + NY).
+        Bloqué le week-end (marchés fermés).
+
+    ─ BTC-USD (crypto) :
+        Actif 24h/24, 7j/7 — Bitcoin ne ferme jamais.
+        Aucune restriction de session ni de jour.
     """
-    hour = datetime.now(timezone.utc).hour
-    return any(start <= hour < end for start, end in SESSION_WINDOWS_UTC)
+    now = datetime.now(timezone.utc)
+
+    # BTC → scan continu, y compris week-end
+    if symbol == "BTC-USD":
+        return True
+
+    # Week-end → marchés Forex/Indices fermés (samedi=5, dimanche=6)
+    if now.weekday() >= 5:
+        return False
+
+    return SESSION_START_UTC <= now.hour < SESSION_END_UTC
+
+
+def get_session_warning() -> str:
+    """
+    Retourne un label d'avertissement si l'heure courante est dans
+    une fenêtre sensible (news, manipulation, faible volume).
+    Retourne '' si heure neutre — aucun avertissement.
+    """
+    now = datetime.now(timezone.utc)
+    now_min = now.hour * 60 + now.minute
+    for (h1, m1, h2, m2, label) in SENSITIVE_WINDOWS_UTC:
+        if h1 * 60 + m1 <= now_min < h2 * 60 + m2:
+            return label
+    return ""
 
 
 def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
@@ -301,17 +392,87 @@ def check_volatility(symbol: str, df_ltf: pd.DataFrame) -> tuple[bool, str]:
     atr_min = ATR_MIN.get(symbol, ATR_MIN_DEFAULT)
     spread  = get_spread(symbol)
 
-    if atr < atr_min * 0.7:
-        return False, f"ATR trop faible ({round(atr, 5)} < {round(atr_min*0.7,5)})"
+    if atr < atr_min * 0.60:
+        return False, f"ATR trop faible ({round(atr, 5)} < {round(atr_min*0.60,5)})"
 
     ratio = spread / atr if atr > 0 else 1.0
     if ratio > MAX_SPREAD_ATR_RATIO:
         return False, f"spread/ATR={round(ratio*100,1)}% > {int(MAX_SPREAD_ATR_RATIO*100)}%"
 
-    if not is_session_active():
-        return False, "hors session (London/NY)"
+    if not is_session_active(symbol):
+        return False, "hors session (avant 07h ou apres 17h UTC) / week-end"
 
     return True, ""
+
+# ─────────────────────────────────────────────────────────────
+#  v8 — FILTRE MARCHÉ : TREND vs RANGE
+# ─────────────────────────────────────────────────────────────
+def market_condition(df_m15: pd.DataFrame) -> str:
+    """
+    Détecte si le marché est en TREND ou en RANGE sur M15.
+
+    Méthode :
+      ATR(14) mesure la volatilité moyenne d'une bougie.
+      Range 20 = distance entre le plus haut et le plus bas des 20 dernières bougies.
+      Si ATR < 15% du range → marché comprimé → RANGE.
+      Sinon → marché directionnel → TREND.
+
+    En RANGE :
+      • Les OB classiques sont invalides (trop de faux signaux)
+      • Seuls les sweeps des extrêmes du range sont tradables
+      → pipeline bloqué partiellement (OB ignorés, FVG aux extrêmes seulement)
+
+    Retourne : "TREND" ou "RANGE"
+    """
+    if df_m15 is None or len(df_m15) < 20:
+        return "TREND"  # fallback → laisse passer le pipeline
+
+    atr = (df_m15["high"] - df_m15["low"]).rolling(14).mean().iloc[-1]
+    range_size = (
+        df_m15["high"].rolling(20).max().iloc[-1]
+        - df_m15["low"].rolling(20).min().iloc[-1]
+    )
+
+    if range_size <= 0 or np.isnan(atr) or np.isnan(range_size):
+        return "TREND"
+
+    if atr < range_size * 0.15:
+        return "RANGE"
+    return "TREND"
+
+
+# ─────────────────────────────────────────────────────────────
+#  v8 — ZONE FRAÎCHE : OB / FVG non mitiqué
+# ─────────────────────────────────────────────────────────────
+def is_zone_fresh(df: pd.DataFrame, zone_top: float, zone_bottom: float,
+                  formed_index: int) -> bool:
+    """
+    Vérifie qu'une zone (OB ou FVG) est FRAÎCHE :
+    le prix n'a PAS clôturé À L'INTÉRIEUR de la zone depuis sa formation.
+
+    Une zone traversée = zone mitiquée = invalide pour une entrée institutionnelle.
+
+    Args:
+        df           : DataFrame complet
+        zone_top     : limite haute de la zone
+        zone_bottom  : limite basse de la zone
+        formed_index : index de formation de la zone dans df
+
+    Retourne True si la zone est intacte (jamais mitiquée depuis formation).
+    """
+    if formed_index + 1 >= len(df):
+        return True  # aucune bougie après la formation → considérée fraîche
+
+    lo = min(zone_top, zone_bottom)
+    hi = max(zone_top, zone_bottom)
+
+    for i in range(formed_index + 1, len(df)):
+        close = df["close"].iloc[i]
+        if lo <= close <= hi:
+            return False  # mitiquée — zone brûlée
+
+    return True  # toujours vierge — zone fraîche
+
 
 # ─────────────────────────────────────────────────────────────
 #  SPREADS TYPIQUES PAR INSTRUMENT  (en prix brut, pas en pips)
@@ -475,24 +636,32 @@ TELEGRAM_CHAT_ID  = None          # Auto-détecté au premier lancement (DM pers
 TELEGRAM_GROUP_ID = "-1002335466840"  # Groupe Telegram
 
 # ── Anti-spam : évite de renvoyer le même signal avant N secondes ──
-SIGNAL_COOLDOWN  = 600           # 10 minutes par (symbol, direction)
+SIGNAL_COOLDOWN  = 900           # 15 minutes par (symbol, direction)
 _signal_cache: dict[str, float] = {}   # clé → timestamp dernier envoi
 
-# ── Un seul signal par setup (symbol + direction + score_bucket) ──
-# Réinitialisé uniquement quand le biais change ou manuellement.
-# Clé : "{symbol}:{direction}:{score_bucket}"  — valeur : True
-_setup_sent: dict[str, bool] = {}
+# ── Un seul signal par setup — clé basée sur le SL (pas le score) ──
+# Le SL identifie l'OB/swing utilisé. Même biais + même SL = même setup.
+# Réinitialisé si le biais H1 change ou après SETUP_TTL secondes.
+_setup_sent: dict[str, float] = {}    # clé → timestamp d'envoi
+SETUP_TTL = 1800                       # 30 min — après ça, re-send autorisé si setup toujours actif
 
-def _setup_key(symbol: str, direction: str, score: int) -> str:
-    """Clé unique de setup : paire + direction + palier de score (tranches de 5 pts)."""
-    bucket = (score // 5) * 5   # ex: score 85 → bucket 85, score 87 → bucket 85
-    return f"{symbol}:{direction}:{bucket}"
+def _setup_key(symbol: str, direction: str, sl: float) -> str:
+    """Clé unique de setup : paire + direction + SL arrondi à 3 décimales significatives."""
+    sl_rounded = round(sl, 3) if sl > 10 else round(sl, 5)
+    return f"{symbol}:{direction}:{sl_rounded}"
 
-def is_setup_already_sent(symbol: str, direction: str, score: int) -> bool:
-    return _setup_sent.get(_setup_key(symbol, direction, score), False)
+def is_setup_already_sent(symbol: str, direction: str, sl: float) -> bool:
+    key = _setup_key(symbol, direction, sl)
+    if key not in _setup_sent:
+        return False
+    # Expire après SETUP_TTL
+    if time.time() - _setup_sent[key] > SETUP_TTL:
+        del _setup_sent[key]
+        return False
+    return True
 
-def mark_setup_sent(symbol: str, direction: str, score: int) -> None:
-    _setup_sent[_setup_key(symbol, direction, score)] = True
+def mark_setup_sent(symbol: str, direction: str, sl: float) -> None:
+    _setup_sent[_setup_key(symbol, direction, sl)] = time.time()
 
 def reset_setup(symbol: str) -> None:
     """Réinitialise les setups d'un symbole (appeler si le biais H1 change)."""
@@ -556,7 +725,7 @@ def tg_send(text: str, chat_id: str) -> bool:
 def tg_format_signal(sig: "Signal", tier: str = "") -> str:
     """Formate un signal en message HTML pour Telegram."""
     dir_emoji  = "🔴 SHORT" if sig.direction == "SHORT" else "🟢 LONG"
-    tier_badge = "🥇 PRIORITÉ" if "TIER 1" in tier else ("🥈 FOREX" if "TIER 2" in tier else "🥉")
+    tier_badge = "🥇 PRIORITE" if "TIER 1" in tier else ("🥈 FOREX" if "TIER 2" in tier else "🥉")
     rr_bar     = "⭐" * min(int(sig.rr), 5)
     score_bar  = "█" * (sig.score // 10) + "░" * (10 - sig.score // 10)
 
@@ -569,18 +738,31 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
     ts = sig.timestamp.strftime("%d/%m/%Y %H:%M UTC")
     gain_usd = round(sig.risk_usd * sig.rr, 2)
 
+    # ── Bannière avertissement heure sensible ──────────────────
+    warning_label = get_session_warning()
+    if warning_label:
+        warning_banner = (
+            f"\n⚠️ <b>ATTENTION — HEURE SENSIBLE</b> ⚠️\n"
+            f"<i>Fenetre : {warning_label}</i>\n"
+            f"<i>Risque de spike / faux mouvement. Attendre confirmation supplementaire ou reduire la taille.</i>\n"
+            f"{'─'*30}\n"
+        )
+    else:
+        warning_banner = ""
+
     msg = (
-        f"<b>⚡ SMC SIGNAL ÉLITE  —  {tier_badge}</b>\n"
+        f"<b>⚡ SMC SIGNAL ELITE  —  {tier_badge}</b>\n"
         f"{'─'*30}\n"
-        f"<b>Marché   :</b>  <code>{sig.symbol}</code>\n"
+        f"{warning_banner}"
+        f"<b>Marche   :</b>  <code>{sig.symbol}</code>\n"
         f"<b>Direction:</b>  <b>{dir_emoji}</b>\n"
         f"<b>Biais H1 :</b>  {sig.htf_bias}\n"
-        f"<b>TF Entrée:</b>  M5 / M15\n"
+        f"<b>TF Analyse:</b>  H1 biais → M15 zone → M5 trigger (v8)\n"
         f"{'─'*30}\n"
-        f"<b>📍 Entrée    :</b>  <code>{sig.entry}</code>\n"
+        f"<b>📍 Entree    :</b>  <code>{sig.entry}</code>  ← <i>prix marche actuel</i>\n"
         f"<b>🔴 Stop Loss :</b>  <code>{sig.sl}</code>   <i>(risk {risk})</i>\n"
         f"<b>🟢 Take Profit:</b> <code>{sig.tp}</code>   <i>(gain brut {gain})</i>\n"
-        f"<b>📊 Spread    :</b>  <code>{spread_disp}</code>   <i>(déduit du RR)</i>\n"
+        f"<b>📊 Spread    :</b>  <code>{spread_disp}</code>   <i>(deduit du RR)</i>\n"
         f"<b>⚖  R : R net :</b>  <b>1 : {sig.rr}</b>  {rr_bar}\n"
         f"{'─'*30}\n"
         f"<b>💰 LOT SIZE  :</b>  <b><code>{sig.lot} lot</code></b>\n"
@@ -599,12 +781,23 @@ def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> N
     """Envoie la notification Telegram au DM personnel ET au groupe."""
     global TELEGRAM_CHAT_ID, TELEGRAM_GROUP_ID, _signal_cache
 
-    # ── Garde-fou : un seul signal par setup (paire + direction + score_bucket) ──
-    if is_setup_already_sent(sig.symbol, sig.direction, sig.score):
-        print(c(f"  [TG] ⏭ Setup déjà envoyé — {sig.symbol} {sig.direction} "
-                f"score≈{(sig.score // 5) * 5} — ignoré.", "yellow"))
+    # ── Guard 1 : Validation SL — jamais envoyer un SL inversé ──
+    if sig.direction == "LONG" and sig.sl >= sig.entry:
+        log.warning(f"  [TG] ⛔ BLOQUÉ — SL LONG inversé ({sig.sl} >= {sig.entry})")
         return
-    mark_setup_sent(sig.symbol, sig.direction, sig.score)
+    if sig.direction == "SHORT" and sig.sl <= sig.entry:
+        log.warning(f"  [TG] ⛔ BLOQUÉ — SL SHORT inversé ({sig.sl} <= {sig.entry})")
+        return
+    if abs(sig.entry - sig.sl) < 0.00003:
+        log.warning(f"  [TG] ⛔ BLOQUÉ — SL trop serré (distance < 0.3 pip)")
+        return
+
+    # ── Guard 2 : Déduplication par SL (même setup = même SL) ──
+    if is_setup_already_sent(sig.symbol, sig.direction, sig.sl):
+        print(c(f"  [TG] ⏭ Setup déjà envoyé — {sig.symbol} {sig.direction} "
+                f"SL={sig.sl} — ignoré.", "yellow"))
+        return
+    mark_setup_sent(sig.symbol, sig.direction, sig.sl)
 
     # ── Résolution chat_id personnel ──────────────────────────
     cid = chat_id or TELEGRAM_CHAT_ID
@@ -635,9 +828,106 @@ def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> N
     else:
         print(c("  [TG] ⚠ Groupe non détecté — ajoutez @leaderodg_bot au groupe et envoyez un message.", "yellow"))
 
-# ─────────────────────────────────────────────────────────────
-#  DATA CLASSES
-# ─────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════
+#  AGENT IA CLAUDE — VÉRIFICATEUR DE SETUP SMC
+#
+#  Rôle : avant tout envoi Telegram, Claude analyse le signal
+#  et vérifie la cohérence SMC (biais, confluence, RR, structure).
+#  Si le setup est douteux → signal bloqué, raison loggée.
+#
+#  Modèle : claude-sonnet-4-20250514  (rapide, précis, économique)
+#  Timeout : 12s (le scan ne doit pas être ralenti)
+# ═════════════════════════════════════════════════════════════
+
+def claude_verify_signal(sig: "Signal") -> tuple[bool, str]:
+    """
+    Envoie le signal à l'agent Claude pour vérification SMC.
+    Retourne (validated: bool, comment: str).
+
+    validated = True  → signal cohérent, envoi autorisé
+    validated = False → signal rejeté, raison dans comment
+    """
+    if not AI_VERIFY_ENABLED:
+        return True, "IA désactivée (mode test)"
+
+    if not ANTHROPIC_API_KEY:
+        log.warning("  [IA] ⚠ ANTHROPIC_API_KEY manquante — vérification IA ignorée.")
+        return True, "Clé API manquante"
+
+    dec = 2 if sig.entry > 100 else 5
+    risk_pts = round(abs(sig.entry - sig.sl), dec)
+    gain_pts = round(abs(sig.tp - sig.entry), dec)
+    confluence_text = "\n".join(f"  - {r}" for r in sig.reasons)
+
+    prompt = f"""Tu es un expert en Smart Money Concepts (SMC) / ICT.
+Analyse ce signal de trading M15 et dis-moi s'il est valide.
+
+=== SIGNAL ===
+Marché    : {sig.symbol}
+Direction : {sig.direction}
+Biais H1  : {sig.htf_bias}
+Entrée    : {sig.entry}
+Stop Loss : {sig.sl}  (risque {risk_pts})
+Take Profit: {sig.tp}  (gain {gain_pts})
+R:R net   : 1:{sig.rr}
+Score     : {sig.score}/100
+TF Entrée : M15 (plus de M5 ni M1)
+
+=== CONFLUENCE ===
+{confluence_text}
+
+=== RÈGLES DE VALIDATION ===
+1. Le biais H1 doit être aligné avec la direction du trade.
+2. Il faut au minimum BOS M15 OU un Order Block M15 validé.
+3. Un FVG actif ou un Breaker Block renforce le setup.
+4. Le RR net doit être ≥ 3.0 — en dessous c'est insuffisant.
+5. Un score < 70 est insuffisant.
+6. Le Stop Loss doit être du bon côté (LONG → SL < entrée, SHORT → SL > entrée).
+
+Réponds UNIQUEMENT en JSON valide, sans markdown, sans explication, format exact :
+{{"validated": true/false, "comment": "Raison courte en français (1-2 phrases max)"}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key"        : ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type"     : "application/json",
+            },
+            json={
+                "model"      : "claude-sonnet-4-20250514",
+                "max_tokens" : 150,
+                "messages"   : [{"role": "user", "content": prompt}],
+            },
+            timeout=12,
+        )
+
+        if resp.status_code != 200:
+            log.warning(f"  [IA] ✗ API Claude {resp.status_code} — signal autorisé par défaut.")
+            return True, f"Erreur API {resp.status_code}"
+
+        raw = resp.json()["content"][0]["text"].strip()
+        # Nettoyage JSON (retire éventuels ```json ... ```)
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = __import__("json").loads(raw)
+
+        validated = bool(result.get("validated", True))
+        comment   = str(result.get("comment", ""))
+
+        icon = "✅" if validated else "❌"
+        log.info(f"  [IA] {icon} {comment}")
+        return validated, comment
+
+    except __import__("json").JSONDecodeError as e:
+        log.warning(f"  [IA] ⚠ JSON invalide de Claude : {e} — signal autorisé.")
+        return True, "Réponse IA non parseable"
+    except Exception as e:
+        log.warning(f"  [IA] ⚠ Erreur agent Claude : {e} — signal autorisé par défaut.")
+        return True, f"Erreur : {e}"
+
+
 @dataclass
 class FVG:
     direction : str          # "bullish" | "bearish"
@@ -1585,25 +1875,35 @@ def compute_score(
     # ── Bonus 3-TF ──────────────────────────────
     mtf_bos: bool = False,       # BOS confirmé sur M15
     mtf_ob: bool  = False,       # OB confirmé sur M15
-    ltf_fvg: bool = False,       # FVG actif sur M5
-    ltf_confirm: bool = False,   # Bougie confirmation M5 (engulfing / pin bar)
-    entry_m1: bool = False,      # Trigger M1 actif
-    # ── Bonus setups avancés (charts BTC + EUR/USD) ──────────
-    breaker_block: bool  = False,  # Breaker Block détecté (OB mitiqué flipé)
-    fvg_30m: bool        = False,  # FVG 30min actif (équivalent 45MIN FVG BTC)
-    fvg_unmitigated: bool = False, # FVG Valid (non mitiqué) — EUR/USD setup
-    trendline_liq: bool  = False,  # Trendline Liquidity sweepée
-    older_block: bool    = False,  # Older Block HTF confirmé (H1 OB actif)
+    ltf_fvg: bool = False,       # FVG actif sur M15
+    ltf_confirm: bool = False,   # Bougie confirmation M15
+    entry_m1: bool = False,      # Trigger M1 (legacy — inactif en v8)
+    # ── Bonus setups avancés ────────────────────
+    breaker_block: bool  = False,
+    fvg_30m: bool        = False,
+    fvg_unmitigated: bool = False,
+    trendline_liq: bool  = False,
+    older_block: bool    = False,
+    # ── v8 NEW ──────────────────────────────────
+    m5_trigger_ok: bool  = False,   # Trigger M5 confirmé (OBLIGATOIRE en v8)
+    zone_fresh_ob: bool  = True,    # OB zone fraîche (non mitiquée)
+    zone_fresh_fvg: bool = True,    # FVG zone fraîche (non mitiquée)
+    market_trend: bool   = True,    # True = TREND, False = RANGE
 ) -> tuple[int, list[str]]:
     """
-    Score composite sur 100 — architecture multi-TF avec setups avancés.
+    Score composite sur 100 — architecture tripolaire v8 avec setups avancés.
 
-    Setups intégrés :
-      • BTC  1H  : 45MIN FVG + Breaker Block + Liquidity Sweep
-      • EUR/USD 15m : Older Block + Trendline Liq + Valid FVG + Upcoming BOS
+    v8 : M5 trigger obligatoire (+10 si présent, signal bloqué si absent).
+         Zones fraîches récompensées (+5 par zone intacte).
+         RANGE pénalisé (OB en range = -10 points).
     """
     score   = 0
     reasons = []
+
+    # ── Pénalité marché RANGE ─────────────────────────────────
+    if not market_trend:
+        score -= 10
+        reasons.append("⚠️ Marché en RANGE — OB moins fiables  (-10)")
 
     # ── H1 Biais (base) ──────────────────────────────────────
     if bias_aligned:
@@ -1616,67 +1916,75 @@ def compute_score(
         reasons.append("✅ BOS M15 confirmé  (+15)")
     elif has_bos:
         score += 8
-        reasons.append("☑️ BOS M5 détecté  (+8)")
+        reasons.append("☑️ BOS M15 détecté  (+8)")
 
     if mtf_ob:
         score += 10
         reasons.append("✅ Order Block M15 validé  (+10)")
     elif has_ob:
         score += 5
-        reasons.append("☑️ Order Block M5  (+5)")
+        reasons.append("☑️ Order Block M15  (+5)")
+
+    # ── Zones fraîches (v8) ───────────────────────────────────
+    if mtf_ob and zone_fresh_ob:
+        score += 5
+        reasons.append("🟢 OB M15 zone fraîche (non mitiquée)  (+5)")
+    elif mtf_ob and not zone_fresh_ob:
+        score -= 5
+        reasons.append("🔴 OB M15 zone mitiquée — zone brûlée  (-5)")
+
+    if ltf_fvg and zone_fresh_fvg:
+        score += 5
+        reasons.append("🟢 FVG M15 zone fraîche (non mitiquée)  (+5)")
 
     # ── Liquidité prise ──────────────────────────────────────
     if liquidity_taken:
         score += 12
         reasons.append("✅ Stop Hunt / Liquidité prise  (+12)")
 
-    # ── M5 FVG + confirmation bougie ─────────────────────────
+    # ── FVG actif ─────────────────────────────────────────────
     if ltf_fvg:
         score += 10
-        reasons.append("✅ FVG M5 actif — prix dans la zone  (+10)")
+        reasons.append("✅ FVG M15 actif — prix dans la zone  (+10)")
     elif has_fvg:
         score += 5
-        reasons.append("☑️ FVG détecté  (+5)")
+        reasons.append("☑️ FVG M15 détecté  (+5)")
 
     if ltf_confirm:
         score += 8
-        reasons.append("✅ Bougie de confirmation M5 (engulfing/pin)  (+8)")
+        reasons.append("✅ Bougie de confirmation M15 (Engulfing / Morning·Evening Star / Pin Bar rejet)  (+8)")
 
-    # ── Trigger M1 ───────────────────────────────────────────
-    if entry_m1:
-        score += 5
-        reasons.append("⚡ Trigger M1 actif — entrée précise  (+5)")
+    # ── v8 : Trigger M5 OBLIGATOIRE ──────────────────────────
+    if m5_trigger_ok:
+        score += 10
+        reasons.append("⚡ Trigger M5 confirmé — entrée sniper  (+10)")
+    # Note : si m5_trigger_ok=False, le signal est bloqué dans analyse() avant ce score
 
     # ══════════════════════════════════════════════════════════
-    #  SETUPS AVANCÉS  (BTC 45MIN FVG + EUR/USD Trendline)
+    #  SETUPS AVANCÉS  (Breaker Block · FVG 30m · EUR/USD)
     # ══════════════════════════════════════════════════════════
 
-    # Breaker Block (OB mitiqué flipé — setup BTC chart)
     if breaker_block:
         score += 12
         reasons.append("🔥 Breaker Block détecté — zone flippée  (+12)")
 
-    # FVG 30min / équivalent 45MIN FVG (chart BTC)
     if fvg_30m:
         score += 10
         reasons.append("📍 FVG 30min actif — zone 45min POI  (+10)")
 
-    # FVG Valid non mitiqué (chart EUR/USD — 'Valid FVG')
     if fvg_unmitigated:
         score += 8
         reasons.append("✅ FVG valide non mitiqué — entrée propre  (+8)")
 
-    # Trendline Liquidity sweepée (chart EUR/USD)
     if trendline_liq:
         score += 10
         reasons.append("🎯 Trendline Liquidity sweepée — stop hunt  (+10)")
 
-    # Older Block HTF actif (chart EUR/USD — résistance H1)
     if older_block:
         score += 10
         reasons.append("🏛️ Older Block HTF actif — confluence HTF  (+10)")
 
-    return min(score, 100), reasons
+    return min(max(score, 0), 100), reasons
 
 # ─────────────────────────────────────────────────────────────
 #  CALCUL ENTRÉE / SL / TP — RR NET SPREAD GARANTI ≥ 3
@@ -1719,22 +2027,43 @@ def compute_sl_tp(
     spread = get_spread(symbol) if symbol else 0.0
     dec    = 2 if close > 100 else 5
 
-    # ── 1. ENTRÉE ────────────────────────────────────────────
+    # ── 1. ENTRÉE — prix actuel si dans la zone FVG, sinon midpoint ──
+    # CONCORDANCE : l'utilisateur entre au prix actuel du marché.
+    # On utilise le close M5 courant s'il est dans la zone FVG active.
+    # Le midpoint FVG n'est utilisé que si le prix n'est pas encore dedans
+    # (signal anticipé — rare avec nos filtres).
     if fvg is not None:
         fvg_hi  = max(fvg.top, fvg.bottom)
         fvg_lo  = min(fvg.top, fvg.bottom)
-        entry   = round((fvg_hi + fvg_lo) / 2.0, dec)
+        if fvg_lo <= close <= fvg_hi:
+            # Prix DANS la zone → entrée = prix actuel (concordance parfaite)
+            entry = round(close, dec)
+        else:
+            # Prix pas encore dans la zone → midpoint comme cible d'entrée limite
+            entry = round((fvg_hi + fvg_lo) / 2.0, dec)
     else:
         entry   = round(close, dec)
 
-    # ── 2. STOP LOSS (bord OB + buffer défensif réel) ────────────
-    # buf = max(55% ATR, 3× spread) — protège contre le bruit normal
-    # Était 40% ATR → trop serré, prix touchait le SL avant le TP
-    buf = max(atr * 0.55, spread * 3.0)
+    # ── 2. STOP LOSS — buffer wick-proof ──────────────────────────
+    # buf = max(75% ATR, 4× spread)
+    # SL positionné sous le plus bas wick des 5 dernières bougies (LONG)
+    # ou au-dessus du plus haut wick (SHORT) pour résister aux mèches.
+    buf = max(atr * 0.75, spread * 4.0)
     if direction == "LONG":
-        sl = round((ob.bottom - buf) if ob else (entry - atr * 1.8), dec)
+        if ob:
+            raw_sl     = ob.bottom - buf
+            recent_low = df["low"].iloc[-5:].min()
+            # Prend le plus bas entre l'OB-buf et le wick récent-buf*0.5
+            sl = round(min(raw_sl, recent_low - buf * 0.5), dec)
+        else:
+            sl = round(entry - atr * 1.8, dec)
     else:
-        sl = round((ob.top    + buf) if ob else (entry + atr * 1.8), dec)
+        if ob:
+            raw_sl      = ob.top + buf
+            recent_high = df["high"].iloc[-5:].max()
+            sl = round(max(raw_sl, recent_high + buf * 0.5), dec)
+        else:
+            sl = round(entry + atr * 1.8, dec)
 
     risk = round(abs(entry - sl), dec + 2)
     if risk <= 0:
@@ -1774,79 +2103,351 @@ def compute_sl_tp(
 
     return entry, sl, tp, rr_net
 
-# ─────────────────────────────────────────────────────────────
-#  BOUGIE DE CONFIRMATION M5/M1
-# ─────────────────────────────────────────────────────────────
-def detect_confirmation_candle(df: pd.DataFrame, direction: str) -> bool:
-    """
-    Détecte une bougie de confirmation sur les 3 dernières bougies CLÔTURÉES.
-      LONG  → Bullish Engulfing ou Pin Bar haussière (mèche basse > corps × 2)
-      SHORT → Bearish Engulfing ou Pin Bar baissière (mèche haute > corps × 2)
+# ═════════════════════════════════════════════════════════════
+#  BIBLIOTHÈQUE DE PATTERNS DE CONFIRMATION  v7
+#
+#  ARCHITECTURE D'ENTRÉE : H1 biais → M15 structure → M5 entrée précise
+#
+#  PATTERNS M15 (confirmation de zone) :
+#    1.  Bullish / Bearish Engulfing
+#    2.  Morning Star / Evening Star
+#    3.  Pin Bar de rejet (mèche ≥ 2.5× corps, corps dans 1/3 opposé)
+#    4.  Doji de retournement (Dragonfly / Gravestone)
+#    5.  Tweezer Bottom / Top (double test d'une zone)
+#    6.  Three White Soldiers / Three Black Crows
+#    7.  Hammer / Hanging Man  (corps compact + longue mèche)
+#    8.  Shooting Star / Inverted Hammer
+#    9.  Harami (corps interne à la bougie précédente)
+#   10.  Inside Bar Break (cassure d'une inside bar = compression + expansion)
+#
+#  PATTERNS M5 (trigger d'entrée précis) :
+#    Mêmes patterns mais sur df_m5 — donne le signal d'entrée exact
+#    après confirmation M15 de la zone.
+#
+#  RÈGLE ANTI-BRUIT :
+#    - Toutes les bougies testées sont CLÔTURÉES (iloc[-2] et avant)
+#    - iloc[-1] = bougie vivante → IGNORÉE systématiquement
+#    - Fenêtre de recherche : 5 dernières bougies clôturées
+# ═════════════════════════════════════════════════════════════
 
-    NOTE : on commence à iloc[-2] (dernière bougie clôturée).
-    iloc[-1] est la bougie en cours de formation → données incomplètes → bruit.
+def _candle_metrics(df: pd.DataFrame, i: int) -> dict:
+    """Retourne les métriques d'une bougie à l'index i (négatif)."""
+    o  = df["open"].iloc[i]
+    h  = df["high"].iloc[i]
+    l  = df["low"].iloc[i]
+    cl = df["close"].iloc[i]
+    body       = abs(cl - o)
+    candle_rng = h - l
+    upper_wick = h - max(o, cl)
+    lower_wick = min(o, cl) - l
+    bull = cl >= o
+    return dict(o=o, h=h, l=l, cl=cl, body=body, rng=candle_rng,
+                uw=upper_wick, lw=lower_wick, bull=bull)
+
+
+def detect_confirmation_candle(df: pd.DataFrame, direction: str,
+                                label_out: list = None) -> bool:
     """
-    if len(df) < 4:
+    Détecte une bougie de confirmation parmi 10 patterns institutionnels.
+
+    LONG  = cherche patterns haussiers
+    SHORT = cherche patterns baissiers
+
+    label_out : si fourni (liste vide []), y ajoute le nom du pattern détecté.
+    Retourne True dès le premier pattern validé.
+    """
+    if len(df) < 8:
         return False
 
-    for i in range(-2, -5, -1):   # [-2, -3, -4] — bougies clôturées uniquement
-        o = df["open"].iloc[i]
-        h = df["high"].iloc[i]
-        l = df["low"].iloc[i]
-        cl = df["close"].iloc[i]
-        body    = abs(cl - o)
-        if body == 0:
+    # On inspecte les 5 dernières bougies CLÔTURÉES : [-2] à [-6]
+    # ([-1] = bougie vivante → ignorée)
+    for i in range(-2, -7, -1):
+        if abs(i) + 2 > len(df):
+            break
+
+        c0 = _candle_metrics(df, i)
+        if c0["body"] == 0 or c0["rng"] == 0:
             continue
-        upper_wick = h - max(o, cl)
-        lower_wick = min(o, cl) - l
 
+        # Bougie précédente (pour patterns à 2+ bougies)
+        c1 = _candle_metrics(df, i - 1) if abs(i - 1) <= len(df) - 1 else None
+        c2 = _candle_metrics(df, i - 2) if abs(i - 2) <= len(df) - 1 else None
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 1 — ENGULFING  (2 bougies)
+        #  Corps courant englobe intégralement le corps précédent.
+        #  Corps courant ≥ 1.3× corps précédent (force minimale).
+        # ──────────────────────────────────────────────────────
+        if c1 is not None and c1["body"] > 0:
+            if direction == "LONG" and c0["bull"] and not c1["bull"]:
+                if (c0["cl"] >= max(c1["o"], c1["cl"])
+                        and c0["o"] <= min(c1["o"], c1["cl"])
+                        and c0["body"] >= c1["body"] * 1.3):
+                    if label_out is not None:
+                        label_out.append("Bullish Engulfing")
+                    return True
+            if direction == "SHORT" and not c0["bull"] and c1["bull"]:
+                if (c0["cl"] <= min(c1["o"], c1["cl"])
+                        and c0["o"] >= max(c1["o"], c1["cl"])
+                        and c0["body"] >= c1["body"] * 1.3):
+                    if label_out is not None:
+                        label_out.append("Bearish Engulfing")
+                    return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 2 — MORNING STAR / EVENING STAR  (3 bougies)
+        #  B-2 : forte impulsion contraire
+        #  B-1 : indécision (corps < 35% de B-2)
+        #  B0  : confirmation ≥ 50% du corps de B-2
+        # ──────────────────────────────────────────────────────
+        if c1 is not None and c2 is not None and c2["body"] > 0:
+            indecision = c1["body"] < c2["body"] * 0.35
+            if direction == "LONG":
+                b2_mid = (c2["o"] + c2["cl"]) / 2
+                if (not c2["bull"]                  # B-2 baissière forte
+                        and indecision
+                        and c0["bull"]              # B0 haussière
+                        and c0["cl"] > b2_mid       # récupère > 50% de B-2
+                        and c0["body"] >= c2["body"] * 0.5):
+                    if label_out is not None:
+                        label_out.append("Morning Star")
+                    return True
+            if direction == "SHORT":
+                b2_mid = (c2["o"] + c2["cl"]) / 2
+                if (c2["bull"]                      # B-2 haussière forte
+                        and indecision
+                        and not c0["bull"]          # B0 baissière
+                        and c0["cl"] < b2_mid
+                        and c0["body"] >= c2["body"] * 0.5):
+                    if label_out is not None:
+                        label_out.append("Evening Star")
+                    return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 3 — PIN BAR DE REJET  (1 bougie)
+        #  Mèche de rejet ≥ 2.5× corps
+        #  Corps dans le tiers OPPOSÉ à la mèche (≥ 55% de la hauteur totale)
+        #  Mèche opposée courte (< 30% du corps)
+        # ──────────────────────────────────────────────────────
         if direction == "LONG":
-            # Bullish engulfing
-            if cl > o and i > -3:
-                prev_o = df["open"].iloc[i - 1]
-                prev_c = df["close"].iloc[i - 1]
-                if prev_c < prev_o and cl > prev_o and o < prev_c:
-                    return True
-            # Pin bar haussière
-            if lower_wick >= body * 2 and cl > o:
+            body_pos = (min(c0["o"], c0["cl"]) - c0["l"]) / c0["rng"]
+            if (c0["lw"] >= c0["body"] * 2.5
+                    and c0["uw"] < c0["body"] * 0.30
+                    and body_pos >= 0.55):
+                if label_out is not None:
+                    label_out.append("Bullish Pin Bar")
+                return True
+        if direction == "SHORT":
+            body_pos = (c0["h"] - max(c0["o"], c0["cl"])) / c0["rng"]
+            if (c0["uw"] >= c0["body"] * 2.5
+                    and c0["lw"] < c0["body"] * 0.30
+                    and body_pos >= 0.55):
+                if label_out is not None:
+                    label_out.append("Bearish Pin Bar")
                 return True
 
-        elif direction == "SHORT":
-            # Bearish engulfing
-            if cl < o and i > -3:
-                prev_o = df["open"].iloc[i - 1]
-                prev_c = df["close"].iloc[i - 1]
-                if prev_c > prev_o and cl < prev_o and o > prev_c:
-                    return True
-            # Pin bar baissière
-            if upper_wick >= body * 2 and cl < o:
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 4 — DOJI DE RETOURNEMENT  (1 bougie)
+        #  Dragonfly Doji (LONG) : corps quasi nul + longue mèche basse
+        #  Gravestone Doji (SHORT) : corps quasi nul + longue mèche haute
+        #  Corps ≤ 5% du range total
+        # ──────────────────────────────────────────────────────
+        if c0["rng"] > 0 and c0["body"] / c0["rng"] <= 0.05:
+            if direction == "LONG" and c0["lw"] >= c0["rng"] * 0.65:
+                if label_out is not None:
+                    label_out.append("Dragonfly Doji")
                 return True
+            if direction == "SHORT" and c0["uw"] >= c0["rng"] * 0.65:
+                if label_out is not None:
+                    label_out.append("Gravestone Doji")
+                return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 5 — TWEEZER BOTTOM / TOP  (2 bougies)
+        #  Double test exact d'une zone (lows / highs quasi identiques)
+        #  Tolérance : 20% de l'ATR sur 14 périodes
+        # ──────────────────────────────────────────────────────
+        if c1 is not None:
+            atr_tw = (df["high"] - df["low"]).rolling(14).mean().iloc[i]
+            tol    = atr_tw * 0.20 if not np.isnan(atr_tw) else c0["rng"] * 0.15
+            if direction == "LONG":
+                if (abs(c0["l"] - c1["l"]) <= tol      # mêmes lows
+                        and c0["bull"]                  # bougie courante haussière
+                        and not c1["bull"]):            # bougie précédente baissière
+                    if label_out is not None:
+                        label_out.append("Tweezer Bottom")
+                    return True
+            if direction == "SHORT":
+                if (abs(c0["h"] - c1["h"]) <= tol
+                        and not c0["bull"]
+                        and c1["bull"]):
+                    if label_out is not None:
+                        label_out.append("Tweezer Top")
+                    return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 6 — THREE WHITE SOLDIERS / THREE BLACK CROWS
+        #  3 bougies consécutives dans le même sens
+        #  Chaque corps ≥ 60% du range, clôtures progressives
+        #  Corps ≥ ATR×0.5 chacun (pas de micro-bougies)
+        # ──────────────────────────────────────────────────────
+        if i <= -4 and c1 is not None and c2 is not None:
+            atr_3 = (df["high"] - df["low"]).rolling(14).mean().iloc[i]
+            if not np.isnan(atr_3) and atr_3 > 0:
+                solid = lambda m: m["body"] / m["rng"] >= 0.60 and m["body"] >= atr_3 * 0.5
+                if direction == "LONG":
+                    if (c0["bull"] and c1["bull"] and c2["bull"]
+                            and solid(c0) and solid(c1) and solid(c2)
+                            and c0["cl"] > c1["cl"] > c2["cl"]):
+                        if label_out is not None:
+                            label_out.append("Three White Soldiers")
+                        return True
+                if direction == "SHORT":
+                    if (not c0["bull"] and not c1["bull"] and not c2["bull"]
+                            and solid(c0) and solid(c1) and solid(c2)
+                            and c0["cl"] < c1["cl"] < c2["cl"]):
+                        if label_out is not None:
+                            label_out.append("Three Black Crows")
+                        return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 7 — HAMMER / HANGING MAN  (1 bougie)
+        #  Corps compact dans le tiers supérieur (LONG) ou inférieur (SHORT)
+        #  Mèche inférieure (LONG) ou supérieure (SHORT) ≥ 2× corps
+        #  Corps ≤ 40% du range total
+        #  Différence avec Pin Bar : le corps peut être légèrement plus grand
+        # ──────────────────────────────────────────────────────
+        if c0["body"] / c0["rng"] <= 0.40:
+            if direction == "LONG":
+                body_pos_h = (min(c0["o"], c0["cl"]) - c0["l"]) / c0["rng"]
+                if c0["lw"] >= c0["body"] * 2.0 and body_pos_h >= 0.50:
+                    if label_out is not None:
+                        label_out.append("Hammer")
+                    return True
+            if direction == "SHORT":
+                body_pos_h = (c0["h"] - max(c0["o"], c0["cl"])) / c0["rng"]
+                if c0["uw"] >= c0["body"] * 2.0 and body_pos_h >= 0.50:
+                    if label_out is not None:
+                        label_out.append("Hanging Man / Shooting Star")
+                    return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 8 — SHOOTING STAR / INVERTED HAMMER  (1 bougie)
+        #  Corps dans le tiers bas avec longue mèche haute (SHORT)
+        #  Corps dans le tiers haut avec longue mèche basse (LONG)
+        #  Confirmation de rejet de résistance / support
+        # ──────────────────────────────────────────────────────
+        if direction == "SHORT" and c0["uw"] >= c0["body"] * 3.0:
+            body_pos_ss = (c0["h"] - max(c0["o"], c0["cl"])) / c0["rng"]
+            if body_pos_ss >= 0.60 and c0["lw"] < c0["body"] * 0.50:
+                if label_out is not None:
+                    label_out.append("Shooting Star")
+                return True
+        if direction == "LONG" and c0["lw"] >= c0["body"] * 3.0:
+            body_pos_ih = (min(c0["o"], c0["cl"]) - c0["l"]) / c0["rng"]
+            if body_pos_ih >= 0.60 and c0["uw"] < c0["body"] * 0.50:
+                if label_out is not None:
+                    label_out.append("Inverted Hammer")
+                return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 9 — HARAMI  (2 bougies)
+        #  Corps courant INCLUS dans le corps précédent
+        #  Retournement après forte bougie extérieure
+        # ──────────────────────────────────────────────────────
+        if c1 is not None and c1["body"] > 0:
+            c0_hi_body = max(c0["o"], c0["cl"])
+            c0_lo_body = min(c0["o"], c0["cl"])
+            c1_hi_body = max(c1["o"], c1["cl"])
+            c1_lo_body = min(c1["o"], c1["cl"])
+            if (c0_hi_body <= c1_hi_body and c0_lo_body >= c1_lo_body
+                    and c0["body"] < c1["body"] * 0.60):
+                if direction == "LONG" and not c1["bull"] and c0["bull"]:
+                    if label_out is not None:
+                        label_out.append("Bullish Harami")
+                    return True
+                if direction == "SHORT" and c1["bull"] and not c0["bull"]:
+                    if label_out is not None:
+                        label_out.append("Bearish Harami")
+                    return True
+
+        # ──────────────────────────────────────────────────────
+        #  PATTERN 10 — INSIDE BAR BREAK  (3 bougies)
+        #  B-2 : grande bougie impulsive (mère)
+        #  B-1 : inside bar (high < mère.high ET low > mère.low) → compression
+        #  B0  : cassure dans le sens du biais → expansion
+        # ──────────────────────────────────────────────────────
+        if c1 is not None and c2 is not None and c2["body"] > 0:
+            # B-1 est une inside bar par rapport à B-2
+            inside = (c1["h"] <= c2["h"] and c1["l"] >= c2["l"])
+            if inside:
+                if direction == "LONG":
+                    # Cassure haussière : close au-dessus du high de B-1
+                    if c0["cl"] > c1["h"] and c0["bull"]:
+                        if label_out is not None:
+                            label_out.append("Inside Bar Bullish Break")
+                        return True
+                if direction == "SHORT":
+                    # Cassure baissière : close en-dessous du low de B-1
+                    if c0["cl"] < c1["l"] and not c0["bull"]:
+                        if label_out is not None:
+                            label_out.append("Inside Bar Bearish Break")
+                        return True
 
     return False
 
 
 # ─────────────────────────────────────────────────────────────
-#  MOTEUR PRINCIPAL — 3 TIMEFRAMES (H1 → M15 → M5/M1)
+#  TRIGGER M5 — ENTRÉE PRÉCISE POST-CONFIRMATION M15
+#
+#  Architecture : M15 confirme la zone → M5 donne l'entrée exacte
+#  Retourne (trigger_ok, pattern_name, entry_price)
+#
+#  Utilise les mêmes 10 patterns mais sur le df M5.
+#  Entrée = close de la bougie M5 de confirmation.
+# ─────────────────────────────────────────────────────────────
+def detect_m5_entry_trigger(df_m5: pd.DataFrame,
+                             direction: str) -> tuple[bool, str, float]:
+    """
+    Cherche un trigger d'entrée précis sur M5 après confirmation M15.
+    Retourne (ok, pattern_name, entry_price).
+    """
+    if df_m5 is None or df_m5.empty or len(df_m5) < 8:
+        return False, "", 0.0
+
+    label = []
+    found = detect_confirmation_candle(df_m5, direction, label_out=label)
+    if found:
+        entry_px = df_m5["close"].iloc[-2]   # dernière bougie clôturée
+        return True, (label[0] if label else "Pattern M5"), entry_px
+
+    return False, "", 0.0
+
+
+# ─────────────────────────────────────────────────────────────
+#  MOTEUR PRINCIPAL v8 — 3 TIMEFRAMES (H1 biais → M15 zone → M5 trigger)
+#  M5 trigger OBLIGATOIRE — sans confirmation M5, signal rejeté.
 # ─────────────────────────────────────────────────────────────
 def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
             silent: bool = False) -> Optional[Signal]:
-    mtf = MTF   # M15 confirmation structure
 
     if not silent:
         print(f"\n{c('═'*60, 'cyan')}")
-        print(f"  {c('SMC ENGINE', 'yellow')}  —  {c(symbol, 'white')}  "
+        print(f"  {c('SMC ENGINE v8', 'yellow')}  —  {c(symbol, 'white')}  "
               f"{c(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'cyan')}")
-        print(f"  {c(f'H1 → {mtf} → {ltf}', 'cyan')}")
+        print(f"  {c(f'H1 biais → M15 zone → M5 trigger (OBLIGATOIRE)', 'cyan')}")
         print(c("═" * 60, "cyan"))
 
-    # ── Téléchargement 3 TF uniquement : H1 / M15 / M5 ─────────
+    # ── Téléchargement 3 TF : H1 / M15 / M5 ────────────────
     if not silent:
-        print(f"  {c('↓', 'cyan')} Data  {htf} / {mtf} / {ltf} …")
+        print(f"  {c('↓', 'cyan')} Data  {htf} / {ltf} / 5m (tripolaire v8)…")
     df_htf = fetch(symbol, htf, period="10d")
-    df_mtf = fetch(symbol, mtf, period="5d")
-    df_ltf = fetch(symbol, ltf, period="2d")
+    df_ltf = fetch(symbol, ltf, period="5d")   # M15 : zone institutionnelle
+    df_m5  = fetch(symbol, "5m", period="2d")  # M5  : trigger obligatoire
 
-    if df_htf.empty or df_mtf.empty or df_ltf.empty:
+    df_mtf = df_ltf   # alias M15
+
+    if df_htf.empty or df_ltf.empty:
         if not silent:
             print(c("  ✗ Données indisponibles.", "red"))
         return None
@@ -1857,6 +2458,13 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         if not silent:
             print(c(f"  ⛔ Marché ignoré : {vol_reason}", "yellow"))
         return None
+
+    # ── v8 : FILTRE MARCHÉ (TREND / RANGE) ───────────────────
+    mkt_cond   = market_condition(df_ltf)
+    market_is_trend = (mkt_cond == "TREND")
+    if not silent:
+        cond_color = "green" if market_is_trend else "yellow"
+        print(f"  {'🏗 Condition marché':<26} {c(mkt_cond, cond_color)}")
 
     # ── H1 : Biais directionnel ──────────────────────────────
     bias = htf_bias(df_htf)
@@ -1899,7 +2507,26 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         )
         return pre_bos_signal
 
-    # ── M15 : Structure intermédiaire ────────────────────────
+    # ── M15 : Structure + zone institutionnelle ──────────────
+    df_mtf = df_ltf   # alias
+
+    # ── v8 : Trigger M5 OBLIGATOIRE ──────────────────────────
+    m5_trigger_ok, m5_pattern, m5_entry_px = detect_m5_entry_trigger(
+        df_m5 if not df_m5.empty else None, direction
+    )
+    if not silent:
+        if m5_trigger_ok:
+            print(f"  {c('⚡ Trigger M5', 'magenta'):<26} {c(m5_pattern, 'yellow')}")
+        else:
+            print(f"  {'Trigger M5':<26} {c('⛔ ABSENT — requis en v8', 'red')}")
+
+    # ── v8 : BLOCAGE si pas de trigger M5 ────────────────────
+    if not m5_trigger_ok:
+        if not silent:
+            print(c("\n  ✗ v8 : Trigger M5 absent — signal rejeté.\n"
+                    "    (La confirmation M5 est OBLIGATOIRE en v8 — pas d'entrée sans trigger)", "red"))
+        return None
+
     bos_mtf = detect_bos(df_mtf)
     obs_mtf = detect_order_blocks(df_mtf, bos_mtf)
     liq_mtf = detect_liquidity_sweep(df_mtf)
@@ -1912,24 +2539,53 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     # OB M15 pour SL précis
     ob_mtf_match = next((o for o in reversed(obs_mtf) if o.direction == bias.lower()), None)
 
-    # ── M5 : FVG + OB entrée ─────────────────────────────────
-    bos_ltf  = detect_bos(df_ltf)
+    # ── M15 : FVG + OB entrée (même df) ──────────────────────
+    bos_ltf  = bos_mtf
     fvgs_ltf = detect_fvg(df_ltf)
-    obs_ltf  = detect_order_blocks(df_ltf, bos_ltf)
+    obs_ltf  = obs_mtf
 
-    last_bos_ltf = bos_ltf[-1] if bos_ltf else None
-    has_bos_ltf  = last_bos_ltf is not None and last_bos_ltf["type"] == bias.lower()
+    last_bos_ltf = last_bos_mtf
+    has_bos_ltf  = mtf_bos
 
     fvg_active = active_fvg(df_ltf, fvgs_ltf, bias.lower())
     ltf_fvg    = fvg_active is not None
-    has_ob_ltf = any(o.direction == bias.lower() for o in obs_ltf)
-    ob_ltf_match = next((o for o in reversed(obs_ltf) if o.direction == bias.lower()), None)
+    has_ob_ltf = mtf_ob
+    ob_ltf_match = ob_mtf_match
 
-    # OB utilisé pour le SL : M5 si dispo, sinon M15
+    # OB utilisé pour le SL : M15 uniquement
     ob_for_sl = ob_ltf_match or ob_mtf_match
 
-    # ── Bougie de confirmation M5 ────────────────────────────
-    ltf_confirm = detect_confirmation_candle(df_ltf, direction)
+    # ── v8 : ZONE FRAÎCHE — OB et FVG ────────────────────────
+    zone_fresh_ob = True
+    if ob_mtf_match is not None:
+        zone_fresh_ob = is_zone_fresh(
+            df_ltf,
+            ob_mtf_match.top,
+            ob_mtf_match.bottom,
+            ob_mtf_match.index,
+        )
+        if not silent:
+            freshness_color = "green" if zone_fresh_ob else "red"
+            freshness_label = "✓ Fraîche" if zone_fresh_ob else "✗ Mitiquée — brûlée"
+            print(f"  {'Zone OB M15':<26} {c(freshness_label, freshness_color)}")
+
+    zone_fresh_fvg = True
+    if fvg_active is not None:
+        zone_fresh_fvg = is_zone_fresh(
+            df_ltf,
+            fvg_active.top,
+            fvg_active.bottom,
+            fvg_active.index,
+        )
+        if not silent:
+            freshness_color = "green" if zone_fresh_fvg else "yellow"
+            freshness_label = "✓ Fraîche" if zone_fresh_fvg else "△ Partiellement mitiquée"
+            print(f"  {'Zone FVG M15':<26} {c(freshness_label, freshness_color)}")
+
+    # ── Bougie de confirmation M15 ───────────────────────────
+    m15_label = []
+    ltf_confirm = detect_confirmation_candle(df_ltf, direction, label_out=m15_label)
+    m15_pattern_name = m15_label[0] if m15_label else "confirmation M15"
 
     # ══════════════════════════════════════════════════════════
     #  SETUPS AVANCÉS — M15
@@ -1960,7 +2616,7 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     # Upcoming BOS comme niveau TP additionnel
     upcoming_bos = detect_upcoming_bos(df_mtf, direction)
 
-    # ── Score multi-TF + setups avancés ──────────────────────
+    # ── Score multi-TF + setups avancés v8 ───────────────────
     score, reasons = compute_score(
         bias, direction,
         has_bos  = has_bos_ltf,
@@ -1972,13 +2628,31 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         mtf_ob           = mtf_ob,
         ltf_fvg          = ltf_fvg,
         ltf_confirm      = ltf_confirm,
-        entry_m1         = False,        # M1 désactivé — entrée M5
+        entry_m1         = False,
         breaker_block    = breaker_block,
-        fvg_30m          = False,        # 30m désactivé — 3 TF seulement
+        fvg_30m          = False,
         fvg_unmitigated  = fvg_unmitigated,
         trendline_liq    = trendline_liq,
         older_block      = older_block,
+        # v8 nouveaux paramètres
+        m5_trigger_ok    = m5_trigger_ok,
+        zone_fresh_ob    = zone_fresh_ob,
+        zone_fresh_fvg   = zone_fresh_fvg,
+        market_trend     = market_is_trend,
     )
+
+    # ── Remplace le label générique par le nom du pattern réel ──
+    for idx, r in enumerate(reasons):
+        if "Bougie de confirmation" in r:
+            reasons[idx] = (
+                f"✅ Confirmation M15 : {m15_pattern_name}  (+8)"
+            )
+            break
+
+    # ── Bonus M5 trigger — entrée précise sniper ──────────────
+    if m5_trigger_ok:
+        score = min(score + 7, 100)
+        reasons.append(f"⚡ Trigger M5 : {m5_pattern}  — entrée sniper  (+7)")
 
     # ── Affichage détails ────────────────────────────────────
     def tick(v): return c("✓", "green") if v else c("✗", "red")
@@ -1986,10 +2660,10 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"  {'BOS M15':<26} {tick(mtf_bos)}")
         print(f"  {'OB M15':<26} {tick(mtf_ob)}")
         print(f"  {'Liquidité prise (M15)':<26} {tick(liq_taken)}")
-        print(f"  {'FVG M5 actif':<26} {tick(ltf_fvg)}")
+        print(f"  {'FVG M15 actif':<26} {tick(ltf_fvg)}")
         print(f"  {'FVG Valid (non mitiqué)':<26} {tick(fvg_unmitigated)}")
-        print(f"  {'Confirmation M5':<26} {tick(ltf_confirm)}")
-        print(f"  {'Trigger M1':<26} {tick(entry_m1)}")
+        print(f"  {'Confirmation M15':<26} {tick(ltf_confirm)}")
+        print(f"  {'Trigger M1':<26} {c('DÉSACTIVÉ', 'yellow')}")
         print(f"  {c('── Setups Avancés ──', 'cyan')}")
         print(f"  {'Breaker Block M15':<26} {tick(breaker_block)}")
         print(f"  {'FVG 30min (≈45min)':<26} {tick(fvg_30m)}")
@@ -2092,8 +2766,26 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     entry, sl, tp, rr = compute_sl_tp(
         df_ltf, direction, ob_for_sl,
         symbol=symbol,
-        fvg=fvg_active,          # entrée au milieu du FVG M5
+        fvg=fvg_active,
     )
+
+    # ── v8 : Priorité à l'entrée M5 trigger si disponible ────
+    # Le trigger M5 donne le prix de clôture réel de la bougie de confirmation.
+    # C'est l'entrée la plus précise possible.
+    if m5_trigger_ok and m5_entry_px > 0:
+        entry_v8 = round(m5_entry_px, decimals)
+        # Recalcule le RR avec la nouvelle entrée M5 si dans tolérance ±5% du risque
+        risk_orig = abs(entry_v8 - sl)
+        if risk_orig > 0:
+            spread = get_spread(symbol)
+            if direction == "LONG":
+                gain_v8 = (tp - entry_v8) - spread
+            else:
+                gain_v8 = (entry_v8 - tp) - spread
+            rr_v8 = round(gain_v8 / risk_orig, 2) if gain_v8 > 0 else 0.0
+            if rr_v8 >= MIN_RR:
+                entry = entry_v8
+                rr    = rr_v8
 
     # Si un Upcoming BOS est détecté et offre un meilleur RR net → utilise-le comme TP
     if upcoming_bos is not None:
@@ -2141,14 +2833,16 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         score_color = "green" if score >= 80 else ("yellow" if score >= 60 else "red")
         dir_color   = "red" if direction == "SHORT" else "green"
         rr_color    = "green" if rr >= 3 else ("yellow" if rr >= 2 else "red")
-        entry_mode  = "⚡ M1" if entry_m1 else "📍 M5"
+        entry_mode  = "⚡ M5 trigger" if m5_trigger_ok else "📍 M15 close"
 
         print(f"\n  {c('━'*56, 'cyan')}")
-        print(f"  {c('⚡ SIGNAL ÉLITE DÉTECTÉ', 'yellow')}  →  {c(direction, dir_color)}  {entry_mode}")
+        print(f"  {c('⚡ SIGNAL v8 ÉLITE DÉTECTÉ', 'yellow')}  →  {c(direction, dir_color)}  {entry_mode}")
         print(f"  {c('━'*56, 'cyan')}")
-        entry_src   = "🎯 FVG mid" if fvg_active else "📍 close M5"
+        entry_src = (f"⚡ M5 {m5_pattern}" if m5_trigger_ok else
+                     ("🎯 FVG mid" if fvg_active else "📍 close M15"))
         print(f"  {'Symbole':<18} {c(signal.symbol, 'white')}")
         print(f"  {'Direction':<18} {c(signal.direction, dir_color)}")
+        print(f"  {'Marché':<18} {c(mkt_cond, 'green' if market_is_trend else 'yellow')}")
         print(f"  {'─'*40}")
         print(f"  {'📍 Entrée':<18} {c(str(signal.entry), 'white')}   ← {entry_src}")
         print(f"  {'🔴 Stop Loss':<18} {c(str(signal.sl), 'red')}   "
@@ -2269,12 +2963,9 @@ MARKETS: dict[str, list[tuple[str, str]]] = {
 # ─────────────────────────────────────────────────────────────
 
 TIER_1_PRIORITY: list[tuple[str, str]] = [
-    # ── 🥇 GOLD ─────────────────────────────────────────────
+    # ── 🥇 GOLD — priorité absolue ───────────────────────────
     ("GC=F",     "Gold"),
-    ("SI=F",     "Silver"),
-    ("CL=F",     "Oil WTI"),
-    ("BZ=F",     "Oil Brent"),
-    # ── 🥇 BTC ──────────────────────────────────────────────
+    # ── 🥇 BTC — crypto unique, scan 24/7 week-end inclus ────
     ("BTC-USD",  "Bitcoin"),
 ]
 
@@ -2483,7 +3174,7 @@ def scan_watchlist(symbols: list[tuple[str, str]], htf: str, ltf: str,
     total = sum(len(g) for _, g in tiers_filtered)
 
     print(f"\n{c('╔' + '═'*64 + '╗', 'cyan')}")
-    print(f"{c('║', 'cyan')}  {c('SMC SCAN — PRIORITÉ GOLD / BTC / FOREX', 'yellow'):<63}{c('║', 'cyan')}")
+    print(f"{c('║', 'cyan')}  {c('SMC SCAN — PRIORITÉ GOLD 🥇 / BTC 🥇 / FOREX', 'yellow'):<63}{c('║', 'cyan')}")
     print(f"{c('║', 'cyan')}  HTF={htf}  LTF={ltf}  "
           f"score≥{min_score}  RR≥{min_rr}   {ts:<27}{c('║', 'cyan')}")
     print(f"{c('╚' + '═'*64 + '╝', 'cyan')}")
@@ -2750,37 +3441,52 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
             now_hhmm = now_utc.strftime("%H:%M UTC")
 
-            # ── Hors session → pause + heartbeat toutes les 5 min ──
-            if not is_session_active():
-                # Log toutes les 10 cycles (~5 min) pour confirmer que le script tourne
-                if cycle_n % 10 == 1:
-                    log.info(f"  💤 [{cycle_n}] {now_hhmm} — Hors session (London 07-10 / NY 13-16 UTC) — Script actif ✓")
-                with _STATUS_LOCK:
-                    _STATUS["cycle"]     = cycle_n
-                    _STATUS["last_scan"] = now_str
-                    _STATUS["scan_running"] = False
-                time.sleep(interval)
-                continue
+            # ── Hors session → pause sauf BTC (24/7) ──────────
+            # BTC est scanné en continu même le week-end.
+            # Les autres marchés (Forex, Indices) sont bloqués hors London/NY
+            # et le week-end.
+            btc_only_mode = not is_session_active()
+            if btc_only_mode:
+                # Filtre uniquement BTC pour continuer hors session
+                btc_symbols = [(s, m) for s, m in symbols if s == "BTC-USD"]
+                if not btc_symbols:
+                    if cycle_n % 10 == 1:
+                        log.info(f"  💤 [{cycle_n}] {now_hhmm} — Hors session — Script actif ✓")
+                    with _STATUS_LOCK:
+                        _STATUS["cycle"]        = cycle_n
+                        _STATUS["last_scan"]    = now_str
+                        _STATUS["scan_running"] = False
+                    time.sleep(interval)
+                    continue
+                # BTC seulement hors session / week-end
+                symbols_this_cycle = btc_symbols
+                if cycle_n % 5 == 1:
+                    log.info(f"  🟡 [{cycle_n}] {now_hhmm} — Hors session — BTC scan continu (week-end/nuit)")
+            else:
+                symbols_this_cycle = symbols
 
             with _STATUS_LOCK:
                 _STATUS["scan_running"] = True
                 _STATUS["cycle"]        = cycle_n
                 _STATUS["last_scan"]    = now_str
 
-            log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols)} paires")
+            log.info(f"  🔍 [{cycle_n}] {now_hhmm} — Scan {len(symbols_this_cycle)} paires"
+                     + (" [BTC only — week-end/nuit]" if btc_only_mode else ""))
 
             # ── Reset garde corrélation pour ce cycle ──────────
             correlation_guard_reset()
 
             # ── ② Entête tableau ───────────────────────────────
             W = 90
+            mode_label = "🟡 BTC ONLY — week-end/nuit" if btc_only_mode else "🟢 SESSION ACTIVE"
+            n_scan = len(symbols_this_cycle)
             print(f"\n{'╔' + '═'*W + '╗'}")
-            print(f"║  🔍  CYCLE #{cycle_n}  —  {now_str}  —  {len(symbols)} MARCHÉS"
-                  + " " * max(0, W - 4 - 8 - len(now_str) - len(str(len(symbols))) - 17) + "║")
+            print(f"║  🔍  CYCLE #{cycle_n}  —  {now_str}  —  {n_scan} MARCHÉS  {mode_label}"
+                  + " " * max(0, W - 4 - 8 - len(now_str) - len(str(n_scan)) - 17 - len(mode_label)) + "║")
             print(f"║  Score min : {min_score}/100   RR min : 1:{min_rr}   "
-                  + "Confirmations requises : BOS + FVG + OB + Liquidité"
+                  + "Confirmations requises : BOS + FVG + OB + Liquidité + M5 trigger"
                   + " " * max(0, W - 4 - 13 - len(str(min_score)) - 3 -
-                               len(str(min_rr)) - 50) + "║")
+                               len(str(min_rr)) - 58) + "║")
             print(f"{'╠' + '═'*W + '╣'}")
 
             # En-têtes colonnes
@@ -2794,7 +3500,7 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             signals_found: list[tuple[str, str, "Signal", str]] = []   # (mkt, sym, sig, tier_label)
 
             # ── Scan marché par marché ─────────────────────────
-            for i, (sym, mkt) in enumerate(symbols, 1):
+            for i, (sym, mkt) in enumerate(symbols_this_cycle, 1):
                 tier = _tier_of(sym)
                 prefix = f"  {i:<4} {tier}  {mkt:<14} {c(sym, 'cyan'):<12}"
                 print(prefix + "  … ", end="", flush=True)
@@ -2907,6 +3613,22 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             for mkt, sym, sig, tier_lbl in signals_found:
                 log.info(f"  ⚡ SIGNAL {sig.direction} {mkt}  "
                          f"score={sig.score}  RR=1:{sig.rr}  lot={sig.lot}")
+
+                # ══════════════════════════════════════════════
+                #  AGENT IA CLAUDE — Log informatif (non bloquant)
+                #  Le signal passe si score ≥ seuil + RR ≥ min + corrélation OK.
+                #  Claude donne un avis secondaire loggé mais ne bloque plus.
+                # ══════════════════════════════════════════════
+                if AI_VERIFY_ENABLED and ANTHROPIC_API_KEY:
+                    ai_ok, ai_reason = claude_verify_signal(sig)
+                    if ai_ok:
+                        log.info(f"  🤖 [IA] ✅ Avis positif : {ai_reason}")
+                        print(c(f"  🤖 AGENT IA → ✅ {ai_reason}", "green"))
+                    else:
+                        log.warning(f"  🤖 [IA] ⚠ Avis négatif (non bloquant) : {ai_reason}")
+                        print(c(f"  🤖 AGENT IA → ⚠ (avis) {ai_reason}", "yellow"))
+                    # ⚠ Ne pas 'continue' ici — l'IA n'est plus juge final
+
                 tg_notify(sig, tier=tier_lbl)
                 log.info(f"    ✓ Signal Telegram envoyé → {mkt}")
 
@@ -2956,7 +3678,7 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SMC Signal Engine — VPS Ready · London/NY · M1/M5",
+        description="SMC Signal Engine v8 — H1→M15→M5 · M5 Trigger Obligatoire · Zone Fraîche · London/NY",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--symbol",    default=None,
@@ -3016,4 +3738,5 @@ if __name__ == "__main__":
             min_rr    = args.min_rr,
             interval  = args.interval,
         )
+
 
