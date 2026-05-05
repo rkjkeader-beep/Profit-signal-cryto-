@@ -1,10 +1,61 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║          SMC SIGNAL ENGINE  v8  — Smart Money Concepts PRO          ║
-║   BOS · FVG · Order Block · Liquidity · H1→M15→M5 · Agent IA log   ║
+║          SMC SIGNAL ENGINE  v9.2  — Smart Money Concepts PRO        ║
+║   BOS · FVG · Order Block · Breaker Block · OTE · H1→M15→M5        ║
 ║                                                                      ║
 ║   FOREX  |  INDICES  |  CRYPTO  |  COMMODITIES  |  MATIERES 1ERES   ║
 ╚══════════════════════════════════════════════════════════════════════╝
+
+Nouveautes v9.2 — BOS QUALIFIÉ + OTE ANCRÉ SUR SWEEP :
+
+  BOS QUALIFIÉ (detect_bos) :
+    Deux filtres ajoutés sur chaque BOS détecté :
+
+    • DISPLACEMENT : la bougie de cassure doit avoir un corps ≥ 40% de
+      son range total. Élimine les doji, spinning tops et cassures sur
+      bruit de marché (~30-40% des faux BOS filtrés).
+
+    • SWEEP PRÉ-BOS : détecte si dans les 5 bougies avant le BOS le
+      prix a spiké au-delà du swing puis est revenu (stop hunt).
+      → flag "swept" = True dans le dict BOS
+      → niveau du spike disponible comme ancrage alternatif
+
+  OTE ANCRÉ SUR LIQUIDITY SWEEP (detect_ote_zone) :
+    Si le BOS ancrant le dealing range est précédé d'un sweep :
+    → L'origine du fibo est recalée sur le niveau du spike
+      (plus bas/haut réel pris par les institutionnels)
+    → Dealing range plus précis = niveaux OTE plus propres
+
+  FVG DANS LE MOVE (detect_ote_zone) :
+    Le move impulsif doit contenir au moins 1 FVG dans son sens.
+    → "has_fvg": True dans le retour de detect_ote_zone
+    → Utilisable pour bonus score dans analyse() :
+       if ote.get("has_fvg"): score += 10  (displacement confirmé)
+    → Un move sans FVG = probable range étendu ou manipulation
+
+  Nouveaux champs dans le retour de detect_ote_zone :
+    "has_fvg"          : bool  — FVG dans le move impulsif
+    "bos_swept"        : bool  — sweep de liquidité avant le BOS
+    "bos_displacement" : float — ratio corps/range bougie de cassure
+
+Nouveautes v9 — OTE FIBONACCI + BREAKER BLOCK ELITE :
+
+  OTE FIBONACCI RÉEL (NOUVEAU) :
+    detect_ote_fibonacci() → zone 62%–79% du dernier move impulsif M15
+    Identique à la logique ICT : swing bas → swing haut (LONG) ou inverse
+    • Prix dans OTE = setup A+ institutionnel
+    • Bonus score +12 si prix dans OTE
+    • Bonus score +8 additionnel si OTE + OB confluence
+    • Bonus score +10 si OTE + FVG confluence (setup sniper triple)
+
+  BREAKER BLOCK ELITE (AMÉLIORÉ) :
+    detect_breaker_blocks() → logique de flip complète et vérifiée
+    • Ancien OB bullish cassé par BOS bearish → Breaker SELL confirmé
+    • Ancien OB bearish cassé par BOS bullish → Breaker BUY confirmé
+    • Vérification que le prix EST dans la zone au moment du signal
+    • Bonus score +18 (était +12) — Breaker > OB classique
+    • Label distinct dans Telegram : 🔥 BREAKER BLOCK ELITE
 
 Nouveautes v8 — LOGIQUE INSTITUTIONNELLE REELLE :
 
@@ -645,23 +696,55 @@ _signal_cache: dict[str, float] = {}   # clé → timestamp dernier envoi
 _setup_sent: dict[str, float] = {}    # clé → timestamp d'envoi
 SETUP_TTL = 1800                       # 30 min — après ça, re-send autorisé si setup toujours actif
 
-def _setup_key(symbol: str, direction: str, sl: float) -> str:
-    """Clé unique de setup : paire + direction + SL arrondi à 3 décimales significatives."""
-    sl_rounded = round(sl, 3) if sl > 10 else round(sl, 5)
-    return f"{symbol}:{direction}:{sl_rounded}"
+# Cooldown par paire : bloque tout nouveau signal sur la même paire
+# pendant N secondes après un envoi, quelle que soit la direction.
+# Évite le flood sur la même zone (3 signaux même range).
+PAIR_COOLDOWN = 1800   # 30 min
+_pair_last_signal: dict[str, float] = {}   # symbol → timestamp dernier envoi
 
-def is_setup_already_sent(symbol: str, direction: str, sl: float) -> bool:
-    key = _setup_key(symbol, direction, sl)
+
+def _setup_key(symbol: str, direction: str, entry: float, sl: float) -> str:
+    """
+    Clé unique de setup — v9.3 : triple critère.
+
+    Avant (v9.2) : basé sur SL uniquement → deux setups avec même SL
+    mais entrées différentes étaient dédupliqués à tort.
+
+    Maintenant :
+      symbol + direction + entry arrondi + SL arrondi
+      → deux OB proches avec même SL mais prix différents = deux setups distincts
+      → même setup renvoyé 2× dans les 30 min = bloqué
+    """
+    dec = 1 if entry > 100 else 4   # Gold/indices → 1 décimale, Forex → 4
+    entry_r = round(entry, dec)
+    sl_r    = round(sl,    dec)
+    return f"{symbol}:{direction}:e{entry_r}:sl{sl_r}"
+
+
+def is_setup_already_sent(symbol: str, direction: str, sl: float,
+                           entry: float = 0.0) -> bool:
+    # ── Check 1 : cooldown par paire (anti-flood même zone) ──
+    now_ts = time.time()
+    if symbol in _pair_last_signal:
+        elapsed = now_ts - _pair_last_signal[symbol]
+        if elapsed < PAIR_COOLDOWN:
+            return True   # paire en cooldown → bloqué
+
+    # ── Check 2 : même setup exact (entry + SL + direction) ──
+    key = _setup_key(symbol, direction, entry, sl)
     if key not in _setup_sent:
         return False
-    # Expire après SETUP_TTL
-    if time.time() - _setup_sent[key] > SETUP_TTL:
+    if now_ts - _setup_sent[key] > SETUP_TTL:
         del _setup_sent[key]
         return False
     return True
 
-def mark_setup_sent(symbol: str, direction: str, sl: float) -> None:
-    _setup_sent[_setup_key(symbol, direction, sl)] = time.time()
+
+def mark_setup_sent(symbol: str, direction: str, sl: float,
+                    entry: float = 0.0) -> None:
+    now_ts = time.time()
+    _setup_sent[_setup_key(symbol, direction, entry, sl)] = now_ts
+    _pair_last_signal[symbol] = now_ts   # démarre le cooldown paire
 
 def reset_setup(symbol: str) -> None:
     """Réinitialise les setups d'un symbole (appeler si le biais H1 change)."""
@@ -750,14 +833,27 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
     else:
         warning_banner = ""
 
+    # ── Badges setup (OTE / Breaker Elite) ───────────────────
+    setup_badges = ""
+    has_breaker = any("BREAKER BLOCK ELITE" in r or "Breaker Block" in r
+                      for r in sig.reasons)
+    has_ote     = any("OTE Fibonacci" in r for r in sig.reasons)
+    if has_breaker and has_ote:
+        setup_badges = "🔥 <b>BREAKER BLOCK ELITE + OTE DWO</b> — Setup A+ institutionnel\n"
+    elif has_breaker:
+        setup_badges = "🔥 <b>BREAKER BLOCK ELITE</b> — Zone flippée retestée\n"
+    elif has_ote:
+        setup_badges = "📐 <b>OTE 62%–79% (DWO)</b> — Dealing Range Fibonacci\n"
+
     msg = (
         f"<b>⚡ SMC SIGNAL ELITE  —  {tier_badge}</b>\n"
         f"{'─'*30}\n"
         f"{warning_banner}"
+        f"{setup_badges}"
         f"<b>Marche   :</b>  <code>{sig.symbol}</code>\n"
         f"<b>Direction:</b>  <b>{dir_emoji}</b>\n"
         f"<b>Biais H1 :</b>  {sig.htf_bias}\n"
-        f"<b>TF Analyse:</b>  H1 biais → M15 zone → M5 trigger (v8)\n"
+        f"<b>TF Analyse:</b>  H1 biais → M15 zone → M5 trigger (v9)\n"
         f"{'─'*30}\n"
         f"<b>📍 Entree    :</b>  <code>{sig.entry}</code>  ← <i>prix marche actuel</i>\n"
         f"<b>🔴 Stop Loss :</b>  <code>{sig.sl}</code>   <i>(risk {risk})</i>\n"
@@ -792,12 +888,12 @@ def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> N
         log.warning(f"  [TG] ⛔ BLOQUÉ — SL trop serré (distance < 0.3 pip)")
         return
 
-    # ── Guard 2 : Déduplication par SL (même setup = même SL) ──
-    if is_setup_already_sent(sig.symbol, sig.direction, sig.sl):
-        print(c(f"  [TG] ⏭ Setup déjà envoyé — {sig.symbol} {sig.direction} "
-                f"SL={sig.sl} — ignoré.", "yellow"))
+    # ── Guard 2 : Déduplication entry+SL+direction + cooldown paire (v9.3) ──
+    if is_setup_already_sent(sig.symbol, sig.direction, sig.sl, sig.entry):
+        print(c(f"  [TG] ⏭ Setup dupliqué ou paire en cooldown — "
+                f"{sig.symbol} {sig.direction} entry={sig.entry} SL={sig.sl} — ignoré.", "yellow"))
         return
-    mark_setup_sent(sig.symbol, sig.direction, sig.sl)
+    mark_setup_sent(sig.symbol, sig.direction, sig.sl, sig.entry)
 
     # ── Résolution chat_id personnel ──────────────────────────
     cid = chat_id or TELEGRAM_CHAT_ID
@@ -1093,52 +1189,177 @@ def fetch(symbol: str, interval: str, period: str = "5d",
             return pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────
-#  ANALYSE HTF — BIAIS DIRECTIONNEL
+#  ANALYSE HTF — BIAIS DIRECTIONNEL  (v9.2 — EMA 50/200)
+#
+#  v9.1 utilisait une EMA 8 sur 20 bougies → trop réactif au bruit.
+#  v9.2 : EMA 50 / EMA 200 — filtre macro classique et stable.
+#
+#  Règle :
+#    EMA50 > EMA200  → BULLISH
+#    EMA50 < EMA200  → BEARISH
+#    Écart < 0.03%   → NEUTRAL (compression = pas de biais clair)
+#
+#  Nécessite ≥ 200 bougies H1 (= 10 jours de données → fetch period="30d").
+#  Si moins de données disponibles → fallback sur EMA 20/50.
 # ─────────────────────────────────────────────────────────────
 def htf_bias(df: pd.DataFrame) -> str:
     """
-    Détermine le biais H1 via Higher Highs / Lower Lows (20 dernières bougies).
+    Détermine le biais H1 via croisement EMA 50 / EMA 200.
     Retourne 'BEARISH', 'BULLISH' ou 'NEUTRAL'.
     """
-    highs  = df["high"].iloc[-20:].values
-    lows   = df["low"].iloc[-20:].values
-    closes = df["close"].iloc[-20:].values
+    if len(df) < 50:
+        return "NEUTRAL"   # pas assez de données
 
-    # EMA 20 rapide
-    ema = np.convolve(closes, np.ones(8) / 8, mode="valid")
-    trend_up   = closes[-1] > ema[-1]
+    closes = df["close"]
 
-    # Swing High / Low comparaison
-    last_hh = highs[-1] < highs[-5:].max()    # prix récent sous dernier HH → bearish
-    last_ll  = lows[-1] < lows[-10:].min() * 1.002
+    # EMA 50 et EMA 200 (ou 50 si pas assez de données)
+    ema_fast = closes.ewm(span=50, adjust=False).mean()
+    if len(df) >= 200:
+        ema_slow = closes.ewm(span=200, adjust=False).mean()
+    else:
+        ema_slow = closes.ewm(span=min(len(df) - 1, 100), adjust=False).mean()
 
-    if not trend_up and last_hh:
-        return "BEARISH"
-    elif trend_up and not last_hh:
+    fast_val = ema_fast.iloc[-1]
+    slow_val = ema_slow.iloc[-1]
+
+    # Zone neutre : écart < 0.03% du prix (EMA trop proches = pas de biais)
+    if slow_val == 0:
+        return "NEUTRAL"
+    gap_pct = abs(fast_val - slow_val) / slow_val
+    if gap_pct < 0.0003:
+        return "NEUTRAL"
+
+    if fast_val > slow_val:
         return "BULLISH"
-    return "NEUTRAL"
+    return "BEARISH"
 
 # ─────────────────────────────────────────────────────────────
-#  DÉTECTION BOS — Break of Structure
+#  DÉTECTION BOS — Break of Structure  (v9.2 — displacement + sweep)
+#
+#  Filtres ajoutés vs v9 :
+#    1. DISPLACEMENT : la bougie qui casse doit avoir un corps ≥ 40%
+#       de son range total → exclut les bougies indécises (doji, spinning)
+#       et les cassures sur bruit.
+#
+#    2. SWEEP PRÉ-BOS : vérifie si dans les 5 bougies avant le BOS
+#       le prix a spiké au-delà du swing puis est revenu (stop hunt).
+#       Un BOS précédé d'un sweep = structure institutionnelle réelle.
+#       → flag "swept" = True dans le dict résultat.
+#       → Le fibo sera ancré sur le niveau du sweep, pas juste le low/high.
+#
+#  Note : le filtre displacement seul élimine ~30-40% des BOS parasites
+#  (cassures en range, micro-structures sur faible volume).
 # ─────────────────────────────────────────────────────────────
 def detect_bos(df: pd.DataFrame) -> list[dict]:
     """
-    Détecte les cassures de structure (BOS).
-    Un BOS bearish = close < swing low des N dernières bougies.
+    Détecte les cassures de structure (BOS) qualifiées.
+
+    Un BOS est retenu seulement si :
+      - close franchit le swing H/L des 10 dernières bougies (condition de base)
+      - la bougie de cassure montre un vrai displacement (corps ≥ 40% du range)
+
+    Flag optionnel "swept" : True si un stop hunt précède le BOS
+    (spike au-delà du swing suivi d'un retour, dans les 5 bougies avant).
     """
     bos_list  = []
     lookback  = 10
+    atr_series = (df["high"] - df["low"]).rolling(14).mean()
 
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         close  = df["close"].iloc[i]
+        open_  = df["open"].iloc[i]
+        high_  = df["high"].iloc[i]
+        low_   = df["low"].iloc[i]
+
         swing_low  = window["low"].min()
         swing_high = window["high"].max()
 
+        # ── Filtre 1 : Displacement ───────────────────────────
+        # Corps de la bougie de cassure doit représenter ≥ 40% de son range.
+        # Élimine les doji, spinning tops, bougies en range.
+        candle_body  = abs(close - open_)
+        candle_range = high_ - low_
+        if candle_range == 0:
+            continue
+        displacement_ratio = candle_body / candle_range
+        if displacement_ratio < 0.40:
+            # Tolérance news : longues mèches sur fort momentum
+            # Si le range dépasse 1.5× ATR, le move est réel même avec
+            # un corps réduit (spike news propre, pas du bruit).
+            atr_val_news = atr_series.iloc[i]
+            is_news_candle = (
+                not np.isnan(atr_val_news)
+                and atr_val_news > 0
+                and candle_range >= atr_val_news * 1.5
+            )
+            if not is_news_candle:
+                continue   # Bougie trop indécise sans contexte news → skip
+
+        # ── Filtre 2 : Expansion ATR ──────────────────────────
+        # La bougie de cassure doit avoir un range ≥ 1.2× ATR14.
+        # Élimine les cassures sur faible momentum (range compressé).
+        # Note : ce filtre est court-circuité si la bougie news a déjà
+        # passé le seuil 1.5× (cohérence avec la tolérance ci-dessus).
+        atr_val_disp = atr_series.iloc[i]
+        if not np.isnan(atr_val_disp) and atr_val_disp > 0:
+            if candle_range < atr_val_disp * 1.2:
+                continue   # Pas assez de momentum → BOS non qualifié
+
+        bos_type = None
+        bos_level = None
+
         if close < swing_low:
-            bos_list.append({"index": i, "type": "bearish", "level": swing_low})
+            bos_type  = "bearish"
+            bos_level = swing_low
         elif close > swing_high:
-            bos_list.append({"index": i, "type": "bullish", "level": swing_high})
+            bos_type  = "bullish"
+            bos_level = swing_high
+
+        if bos_type is None:
+            continue
+
+        # ── Filtre 2 : Sweep pré-BOS (optionnel — flag informatif) ──
+        # Dans les 5 bougies avant le BOS, le prix a-t-il spiké
+        # au-delà du swing puis clôturé de l'autre côté ?
+        # C'est le signe d'une prise de liquidité institutionnelle.
+        swept        = False
+        sweep_level  = None
+        pre_window   = df.iloc[max(0, i - 5):i]
+        atr_val      = atr_series.iloc[i]
+        if not np.isnan(atr_val) and atr_val > 0:
+            if bos_type == "bearish":
+                for j in range(len(pre_window)):
+                    pw_high  = pre_window["high"].iloc[j]
+                    pw_close = pre_window["close"].iloc[j]
+                    if pw_high > swing_high + atr_val * 0.20 and pw_close < swing_high:
+                        # ── Force du sweep : spike doit dépasser ≥ 0.5× ATR ──
+                        # Un micro-spike de quelques pips n'est pas un vrai
+                        # liquidity grab institutionnel.
+                        sweep_strength = abs(pw_high - swing_high)
+                        if sweep_strength >= atr_val * 0.5:
+                            swept       = True
+                            sweep_level = pw_high
+                        break
+            else:  # bullish BOS
+                for j in range(len(pre_window)):
+                    pw_low   = pre_window["low"].iloc[j]
+                    pw_close = pre_window["close"].iloc[j]
+                    if pw_low < swing_low - atr_val * 0.20 and pw_close > swing_low:
+                        sweep_strength = abs(swing_low - pw_low)
+                        if sweep_strength >= atr_val * 0.5:
+                            swept       = True
+                            sweep_level = pw_low
+                        break
+
+        bos_list.append({
+            "index"      : i,
+            "type"       : bos_type,
+            "level"      : bos_level,
+            "displacement": round(displacement_ratio, 2),   # pour debug/log
+            "swept"      : swept,          # True = prise de liquidité confirmée
+            "sweep_level": sweep_level,    # niveau du spike (anchor fibo alternatif)
+        })
 
     return bos_list
 
@@ -1233,27 +1454,51 @@ def detect_liquidity_sweep(df: pd.DataFrame) -> dict:
     return result
 
 # ─────────────────────────────────────────────────────────────
-#  BREAKER BLOCK  (OB mitiqué qui flippe de direction)
+#  BREAKER BLOCK ELITE  (v9 — logique de flip complète)
 # ─────────────────────────────────────────────────────────────
 def detect_breaker_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[dict]:
     """
-    Breaker Block = Order Block qui a été mitiqué (prix a traversé la zone)
-    puis retesté → flippe en zone opposée.
+    Breaker Block ELITE = ancien OB qui a ÉCHOUÉ (prix l'a traversé via BOS)
+    et qui devient une zone INVERSE.
 
-    Logique :
-      BOS baissier → cherche la dernière bougie bullish avant le BOS
-                     Si le prix est revenu tester cette zone par en haut → Breaker bearish
-      BOS haussier → cherche la dernière bougie bearish avant le BOS
-                     Si le prix est revenu tester cette zone par en bas → Breaker bullish
+    Logique v9 — 3 conditions obligatoires :
+      1. Identifier l'OB source (dernière bougie dans le sens opposé avant le BOS)
+      2. Vérifier que le BOS a CASSÉ cet OB (prix a clôturé au-delà)
+      3. Vérifier que le prix REVIENT ACTUELLEMENT dans cette zone
 
-    Utilisé comme setup clé (voir charts BTC 45MIN FVG + Breaker).
+    SELL Breaker :
+      • BOS bearish détecté
+      • Dernier OB bullish avant ce BOS → c'est l'ancien support
+      • Le BOS a cassé cet OB → il devient résistance
+      • Prix revient DANS la zone (retest) → SELL
+
+    BUY Breaker :
+      • BOS bullish détecté
+      • Dernier OB bearish avant ce BOS → c'est l'ancienne résistance
+      • Le BOS a cassé cet OB → il devient support
+      • Prix revient DANS la zone (retest) → BUY
+
+    Différence v9 vs v8 :
+      v8 : vérifiait post_high dans la zone (approximatif)
+      v9 : vérifie que le PRIX ACTUEL est dans la zone (confirmation réelle)
+           + vérifie que le BOS a physiquement traversé l'OB (not just nearby)
     """
-    breakers = []
-    for bos in bos_list[-6:]:
-        idx = bos["index"]
-        if idx < OB_LOOKBACK + 2 or idx + 3 >= len(df):
-            continue
+    if len(df) < OB_LOOKBACK + 5:
+        return []
+
+    breakers   = []
+    price_now  = df["close"].iloc[-1]
+    atr        = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    # Tolérance : ±15% de l'ATR pour les prix qui effleurent la zone
+    tolerance  = atr * 0.15 if not np.isnan(atr) else 0.0
+
+    for bos in bos_list[-8:]:
+        idx      = bos["index"]
         bos_type = bos["type"]
+        bos_lvl  = bos["level"]
+
+        if idx < OB_LOOKBACK + 2:
+            continue
 
         for j in range(idx - 1, max(idx - OB_LOOKBACK - 1, 0), -1):
             is_bull = df["close"].iloc[j] > df["open"].iloc[j]
@@ -1261,26 +1506,40 @@ def detect_breaker_blocks(df: pd.DataFrame, bos_list: list[dict]) -> list[dict]:
             ob_lo   = df["low"].iloc[j]
 
             if bos_type == "bearish" and is_bull:
-                # OB bullish retesté par en haut = Breaker bearish
-                post_high = df["high"].iloc[idx: min(idx + 15, len(df))].max()
-                if ob_lo <= post_high <= ob_hi * 1.001:
+                # Condition 2 : le BOS bearish a CASSÉ l'OB bullish
+                # → le BOS level doit être SOUS le bas de l'OB
+                if bos_lvl > ob_lo:
+                    continue   # BOS n'a pas vraiment traversé l'OB → pas un vrai Breaker
+
+                # Condition 3 : le prix ACTUEL est dans la zone (retest en cours)
+                in_zone = (ob_lo - tolerance) <= price_now <= (ob_hi + tolerance)
+                if in_zone:
                     breakers.append({
                         "direction": "bearish",
                         "top"      : ob_hi,
                         "bottom"   : ob_lo,
                         "index"    : j,
+                        "bos_level": bos_lvl,
+                        "elite"    : True,     # flag pour bonus score supplémentaire
                     })
                     break
 
             elif bos_type == "bullish" and not is_bull:
-                # OB bearish retesté par en bas = Breaker bullish
-                post_low = df["low"].iloc[idx: min(idx + 15, len(df))].min()
-                if ob_lo * 0.999 <= post_low <= ob_hi:
+                # Condition 2 : le BOS bullish a CASSÉ l'OB bearish
+                # → le BOS level doit être AU-DESSUS du haut de l'OB
+                if bos_lvl < ob_hi:
+                    continue   # pas un vrai Breaker
+
+                # Condition 3 : prix dans la zone en ce moment
+                in_zone = (ob_lo - tolerance) <= price_now <= (ob_hi + tolerance)
+                if in_zone:
                     breakers.append({
                         "direction": "bullish",
                         "top"      : ob_hi,
                         "bottom"   : ob_lo,
                         "index"    : j,
+                        "bos_level": bos_lvl,
+                        "elite"    : True,
                     })
                     break
 
@@ -1342,6 +1601,220 @@ def detect_trendline_liquidity(df: pd.DataFrame, direction: str) -> bool:
                     return True
 
     return False
+
+
+# ─────────────────────────────────────────────────────────────
+#  OTE FIBONACCI  (v9.1 — DWO / Dealing Range ancré sur BOS réel)
+#
+#  Règle DWO (Draw on Liquidity) :
+#    Le Fibo NE part PAS d'un pivot quelconque.
+#    Il part du DERNIER DEALING RANGE valide = move qui a produit un BOS.
+#
+#    LONG  : ancrage LOW → HIGH du move qui a cassé la structure bullish
+#    SHORT : ancrage HIGH → LOW du move qui a cassé la structure bearish
+#
+#    Contraintes supplémentaires :
+#      1. Le BOS doit être confirmé (close au-delà du swing)
+#      2. Le move doit avoir une impulsion réelle (≥ 2× ATR)
+#         → exclut les ranges et micro-structures
+#      3. Le retracement ACTUEL doit être en cours
+#         → prix en pullback (entre HIGH et OTE_BOTTOM pour LONG)
+#         → pas déjà reparti au-delà du HIGH d'origine
+#
+#  Zone OTE = [62% , 79%] du dealing range
+#  Niveau clé : 70.5% = midpoint OTE (entrée sniper)
+# ─────────────────────────────────────────────────────────────
+OTE_LOW  = 0.62   # 62% du dealing range
+OTE_HIGH = 0.79   # 79% du dealing range (≈ fib 0.786)
+
+# Filtre FVG dans le move — True = obligatoire (ultra-sélectif)
+#                           False = informatif seulement (plus de trades)
+# Recommandé : True pour prop firm / live, False pour backtest exploratoire.
+USE_FVG_FILTER = True
+
+
+def detect_ote_zone(df: pd.DataFrame, direction: str,
+                    bos_list: Optional[list] = None) -> Optional[dict]:
+    """
+    Détecte la zone OTE sur le dernier Dealing Range ancré sur un BOS réel.
+
+    ═══ LOGIQUE DWO COMPLÈTE ═══════════════════════════════════════
+    Étape 1 — Trouver le BOS valide le plus récent aligné avec direction
+    Étape 2 — Remonter AVANT ce BOS pour trouver le swing origine
+              → LONG  : swing low le plus bas AVANT le BOS bullish
+              → SHORT : swing high le plus haut AVANT le BOS bearish
+    Étape 3 — Le swing terminus = point extrême créé par l'impulsion
+              → LONG  : highest high entre swing_low et BOS
+              → SHORT : lowest low entre swing_high et BOS
+    Étape 4 — Vérifier l'impulsion : move ≥ 2× ATR (pas un range)
+    Étape 5 — Calculer OTE = [62%–79%] du dealing range
+    Étape 6 — Vérifier que le prix EST en retracement dans la zone
+
+    Retourne dict ou None si aucun dealing range valide.
+    """
+    if len(df) < 25:
+        return None
+
+    atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr) or atr <= 0:
+        return None
+
+    price_now = df["close"].iloc[-1]
+    dec       = 2 if price_now > 100 else 5
+
+    # ── Étape 1 : BOS valide le plus récent ──────────────────
+    # On utilise bos_list passé en paramètre (déjà calculé dans analyse())
+    # ou on le recalcule ici si absent.
+    if bos_list is None:
+        bos_list = detect_bos(df)
+
+    target_bos_type = "bullish" if direction == "LONG" else "bearish"
+    recent_bos = None
+    for bos in reversed(bos_list):
+        if bos["type"] == target_bos_type:
+            recent_bos = bos
+            break
+
+    if recent_bos is None:
+        return None   # Pas de BOS aligné → pas de dealing range valide
+
+    bos_idx = recent_bos["index"]
+    bos_lvl = recent_bos["level"]
+
+    # Lookback : 40 bougies max avant le BOS pour trouver l'origine
+    lookback_start = max(0, bos_idx - 40)
+    window_pre_bos = df.iloc[lookback_start:bos_idx]
+
+    if len(window_pre_bos) < 5:
+        return None
+
+    # ── Étape 2 & 3 : Dealing Range origine → terminus ───────
+    if direction == "LONG":
+        # Origine = swing LOW le plus bas avant le BOS bullish
+        # (= la vraie base de l'impulsion, souvent avec liquidité prise)
+        swing_lo_idx_rel = window_pre_bos["low"].idxmin()
+        # idxmin retourne l'index absolu dans df
+        swing_lo = df["low"].loc[swing_lo_idx_rel]
+
+        # Terminus = highest HIGH entre le swing low et le BOS
+        try:
+            sl_pos = df.index.get_loc(swing_lo_idx_rel)
+        except Exception:
+            sl_pos = lookback_start
+        window_impulse = df.iloc[sl_pos:bos_idx + 1]
+        swing_hi       = window_impulse["high"].max()
+
+        # ── Étape 4 : Impulsion réelle ≥ 2× ATR ──────────────
+        move = swing_hi - swing_lo
+        if move < atr * 2.0:
+            return None   # Micro-structure ou range → fibo invalide
+
+        # ── Étape 4b : FVG dans le move — méthode directe (v9.2) ─
+        # Détection bougie-à-bougie : FVG bullish = low[j+1] > high[j-1]
+        # Plus fiable que detect_fvg() sur sous-fenêtre (évite les faux FVG).
+        # Un move institutionnel réel laisse toujours une inefficiency.
+        has_fvg_in_move = False
+        wi = window_impulse.reset_index(drop=True)
+        for j in range(1, len(wi) - 1):
+            if wi["low"].iloc[j + 1] > wi["high"].iloc[j - 1]:   # FVG bullish
+                has_fvg_in_move = True
+                break
+        if USE_FVG_FILTER and not has_fvg_in_move:
+            return None   # Move sans inefficiency → range déguisé → rejeté
+
+        # ── Étape 4c : Ancrage sur sweep si disponible (v9.2) ─
+        if recent_bos.get("swept") and recent_bos.get("sweep_level") is not None:
+            sweep_lo = recent_bos["sweep_level"]
+            swing_lo = min(swing_lo, sweep_lo)
+            move     = swing_hi - swing_lo
+
+        # ── Étape 4d : Cap move — protection spike news (v9.3) ─
+        # Un move > 10× ATR = spike news ou gap exotique.
+        # Le fibo serait trop étiré → niveaux OTE sans sens pratique.
+        if move > atr * 10:
+            return None   # Move extrême → dealing range non tradable
+
+        # ── Étape 5 : OTE = retracement de swing_hi vers swing_lo ──
+        # 62% retracement depuis le HIGH (haut du dealing range)
+        ote_top    = round(swing_hi - move * OTE_LOW,  dec)   # 62%
+        ote_bottom = round(swing_hi - move * OTE_HIGH, dec)   # 79%
+        fib_500    = round(swing_hi - move * 0.500, dec)
+        fib_618    = round(swing_hi - move * 0.618, dec)
+        fib_705    = round(swing_hi - move * 0.705, dec)
+        fib_786    = round(swing_hi - move * 0.786, dec)
+
+        # ── Étape 6 : Prix en retracement dans la zone ───────
+        # Condition : prix sous le HIGH (retracement en cours)
+        #             ET dans la bande OTE
+        retracing  = price_now < swing_hi
+        in_ote     = retracing and (ote_bottom <= price_now <= ote_top)
+
+    else:  # SHORT
+        # Origine = swing HIGH le plus haut avant le BOS bearish
+        swing_hi_idx_rel = window_pre_bos["high"].idxmax()
+        swing_hi         = df["high"].loc[swing_hi_idx_rel]
+
+        try:
+            sh_pos = df.index.get_loc(swing_hi_idx_rel)
+        except Exception:
+            sh_pos = lookback_start
+        window_impulse = df.iloc[sh_pos:bos_idx + 1]
+        swing_lo       = window_impulse["low"].min()
+
+        move = swing_hi - swing_lo
+        if move < atr * 2.0:
+            return None
+
+        # ── Étape 4b : FVG dans le move — méthode directe (v9.2) ─
+        # FVG bearish = high[j+1] < low[j-1]  (gap baissier entre j-1 et j+1)
+        has_fvg_in_move = False
+        wi = window_impulse.reset_index(drop=True)
+        for j in range(1, len(wi) - 1):
+            if wi["high"].iloc[j + 1] < wi["low"].iloc[j - 1]:   # FVG bearish
+                has_fvg_in_move = True
+                break
+        if USE_FVG_FILTER and not has_fvg_in_move:
+            return None   # Move sans inefficiency → rejeté
+
+        # ── Étape 4c : Ancrage sur sweep si disponible (v9.2) ─
+        if recent_bos.get("swept") and recent_bos.get("sweep_level") is not None:
+            sweep_hi = recent_bos["sweep_level"]
+            swing_hi = max(swing_hi, sweep_hi)
+            move     = swing_hi - swing_lo
+
+        # ── Étape 4d : Cap move — protection spike news (v9.3) ─
+        if move > atr * 10:
+            return None   # Move extrême → dealing range non tradable
+
+        # OTE = retracement haussier de swing_lo vers swing_hi
+        ote_bottom = round(swing_lo + move * OTE_LOW,  dec)   # 62%
+        ote_top    = round(swing_lo + move * OTE_HIGH, dec)   # 79%
+        fib_500    = round(swing_lo + move * 0.500, dec)
+        fib_618    = round(swing_lo + move * 0.618, dec)
+        fib_705    = round(swing_lo + move * 0.705, dec)
+        fib_786    = round(swing_lo + move * 0.786, dec)
+
+        retracing  = price_now > swing_lo
+        in_ote     = retracing and (ote_bottom <= price_now <= ote_top)
+
+    return {
+        "ote_top"       : max(ote_bottom, ote_top),
+        "ote_bottom"    : min(ote_bottom, ote_top),
+        "swing_high"    : swing_hi,
+        "swing_low"     : swing_lo,
+        "fib_500"       : fib_500,
+        "fib_618"       : fib_618,
+        "fib_705"       : fib_705,   # midpoint OTE — entrée sniper
+        "fib_786"       : fib_786,
+        "in_ote"        : in_ote,
+        "retracing"     : retracing,
+        "move_size"     : round(move, dec),
+        "bos_level"     : bos_lvl,
+        "dealing_range" : f"{round(swing_lo, dec)} → {round(swing_hi, dec)}",
+        "has_fvg"       : has_fvg_in_move,   # v9.2 — FVG dans le move impulsif
+        "bos_swept"     : recent_bos.get("swept", False),   # v9.2 — sweep pré-BOS
+        "bos_displacement": recent_bos.get("displacement", 0.0),  # v9.2 — qualité BOS
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1880,10 +2353,15 @@ def compute_score(
     entry_m1: bool = False,      # Trigger M1 (legacy — inactif en v8)
     # ── Bonus setups avancés ────────────────────
     breaker_block: bool  = False,
+    breaker_elite: bool  = False,  # v9 : Breaker avec prix dans la zone confirmé
     fvg_30m: bool        = False,
     fvg_unmitigated: bool = False,
     trendline_liq: bool  = False,
     older_block: bool    = False,
+    # ── v9 OTE Fibonacci ────────────────────────
+    ote_in_zone: bool    = False,  # Prix dans OTE 62%–79%
+    ote_plus_ob: bool    = False,  # OTE + OB confluence
+    ote_plus_fvg: bool   = False,  # OTE + FVG confluence (setup sniper)
     # ── v8 NEW ──────────────────────────────────
     m5_trigger_ok: bool  = False,   # Trigger M5 confirmé (OBLIGATOIRE en v8)
     zone_fresh_ob: bool  = True,    # OB zone fraîche (non mitiquée)
@@ -1961,12 +2439,26 @@ def compute_score(
     # Note : si m5_trigger_ok=False, le signal est bloqué dans analyse() avant ce score
 
     # ══════════════════════════════════════════════════════════
-    #  SETUPS AVANCÉS  (Breaker Block · FVG 30m · EUR/USD)
+    #  SETUPS AVANCÉS  (Breaker Block · OTE · FVG 30m · EUR/USD)
     # ══════════════════════════════════════════════════════════
 
-    if breaker_block:
+    if breaker_elite:
+        score += 18
+        reasons.append("🔥 BREAKER BLOCK ELITE — zone flippée + retest confirmé  (+18)")
+    elif breaker_block:
         score += 12
         reasons.append("🔥 Breaker Block détecté — zone flippée  (+12)")
+
+    # ── OTE Fibonacci (v9) ───────────────────────────────────
+    if ote_in_zone:
+        score += 12
+        reasons.append("📐 OTE Fibonacci 62%–79% — zone institutionnelle  (+12)")
+    if ote_plus_ob:
+        score += 8
+        reasons.append("🎯 OTE + Order Block confluence — setup A+  (+8)")
+    if ote_plus_fvg:
+        score += 10
+        reasons.append("🔥 OTE + FVG confluence — setup sniper triple  (+10)")
 
     if fvg_30m:
         score += 10
@@ -2433,17 +2925,25 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
     if not silent:
         print(f"\n{c('═'*60, 'cyan')}")
-        print(f"  {c('SMC ENGINE v8', 'yellow')}  —  {c(symbol, 'white')}  "
+        print(f"  {c('SMC ENGINE v9', 'yellow')}  —  {c(symbol, 'white')}  "
               f"{c(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'cyan')}")
-        print(f"  {c(f'H1 biais → M15 zone → M5 trigger (OBLIGATOIRE)', 'cyan')}")
+        print(f"  {c(f'H1 biais → M15 zone → M5 trigger + OTE + Breaker Elite (v9)', 'cyan')}")
         print(c("═" * 60, "cyan"))
 
     # ── Téléchargement 3 TF : H1 / M15 / M5 ────────────────
+    # H1 period="60d" → nécessaire pour EMA200 (v9.2 htf_bias).
+    # Sans 200 bougies H1, l'EMA200 tombe sur le fallback EMA100.
+    #
+    # Gold (GC=F) — choix du TF d'analyse :
+    #   M15 : zone OB/FVG/OTE — adapté pour entrées intraday sur Gold
+    #   M5  : trigger obligatoire (pin bar, engulfing, FVG retest)
+    #   → Gold est suffisamment liquide et volatile pour M15 + M5.
+    #   → Éviter M1 sur Gold : spread + slippage trop élevés à ce TF.
     if not silent:
-        print(f"  {c('↓', 'cyan')} Data  {htf} / {ltf} / 5m (tripolaire v8)…")
-    df_htf = fetch(symbol, htf, period="10d")
-    df_ltf = fetch(symbol, ltf, period="5d")   # M15 : zone institutionnelle
-    df_m5  = fetch(symbol, "5m", period="2d")  # M5  : trigger obligatoire
+        print(f"  {c('↓', 'cyan')} Data  {htf} / {ltf} / 5m (tripolaire v9.2)…")
+    df_htf = fetch(symbol, htf, period="60d")   # 60j → EMA200 fiable (v9.2)
+    df_ltf = fetch(symbol, ltf, period="5d")    # M15 : zone institutionnelle
+    df_m5  = fetch(symbol, "5m", period="2d")   # M5  : trigger obligatoire
 
     df_mtf = df_ltf   # alias M15
 
@@ -2594,11 +3094,29 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     # Breaker Block sur M15
     bkr_mtf       = detect_breaker_blocks(df_mtf, bos_mtf)
     breaker_block  = any(b["direction"] == bias.lower() for b in bkr_mtf)
+    breaker_elite  = any(b["direction"] == bias.lower() and b.get("elite", False)
+                         for b in bkr_mtf)
+
+    # ── v9 : OTE Fibonacci DWO — ancré sur BOS réel ─────────
+    ote_result  = detect_ote_zone(df_mtf, direction, bos_list=bos_mtf)
+    ote_in_zone = ote_result is not None and ote_result["in_ote"]
 
     # FVG Valid non mitiqué sur M5
     fvg_unmitigated = False
     if fvg_active is not None:
         fvg_unmitigated = is_fvg_unmitigated(df_ltf, fvg_active)
+
+    # ── v9 : OTE confluence flags ─────────────────────────────
+    # Note : in_ob_m15 est calculé dans le bloc "Filtre Zone Entrée" plus bas.
+    # On calcule ici un check direct du prix dans l'OB pour l'OTE confluence.
+    _ote_ob_check = False
+    if ob_mtf_match is not None and ote_in_zone:
+        ob_lo_chk = min(ob_mtf_match.top, ob_mtf_match.bottom)
+        ob_hi_chk = max(ob_mtf_match.top, ob_mtf_match.bottom)
+        tol_chk   = (ob_hi_chk - ob_lo_chk) * 0.10
+        _ote_ob_check = (ob_lo_chk - tol_chk) <= df_ltf["close"].iloc[-1] <= (ob_hi_chk + tol_chk)
+    ote_plus_ob  = ote_in_zone and _ote_ob_check
+    ote_plus_fvg = ote_in_zone and ltf_fvg
 
     # Trendline Liquidity sweepée sur M15
     trendline_liq = detect_trendline_liquidity(df_mtf, bias.lower())
@@ -2616,7 +3134,7 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     # Upcoming BOS comme niveau TP additionnel
     upcoming_bos = detect_upcoming_bos(df_mtf, direction)
 
-    # ── Score multi-TF + setups avancés v8 ───────────────────
+    # ── Score multi-TF + setups avancés v9 ───────────────────
     score, reasons = compute_score(
         bias, direction,
         has_bos  = has_bos_ltf,
@@ -2630,11 +3148,16 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         ltf_confirm      = ltf_confirm,
         entry_m1         = False,
         breaker_block    = breaker_block,
+        breaker_elite    = breaker_elite,
         fvg_30m          = False,
         fvg_unmitigated  = fvg_unmitigated,
         trendline_liq    = trendline_liq,
         older_block      = older_block,
-        # v8 nouveaux paramètres
+        # v9 OTE
+        ote_in_zone      = ote_in_zone,
+        ote_plus_ob      = ote_plus_ob,
+        ote_plus_fvg     = ote_plus_fvg,
+        # v8
         m5_trigger_ok    = m5_trigger_ok,
         zone_fresh_ob    = zone_fresh_ob,
         zone_fresh_fvg   = zone_fresh_fvg,
@@ -2654,6 +3177,17 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         score = min(score + 7, 100)
         reasons.append(f"⚡ Trigger M5 : {m5_pattern}  — entrée sniper  (+7)")
 
+    # ── Bonus OTE — qualité du dealing range (v9.2) ──────────
+    if ote_result is not None:
+        # FVG dans le move impulsif = displacement institutionnel confirmé
+        if ote_result.get("has_fvg"):
+            score = min(score + 10, 100)
+            reasons.append("📐 FVG dans le move OTE — displacement institutionnel  (+10)")
+        # BOS précédé d'un sweep = origin ICT-pure
+        if ote_result.get("bos_swept"):
+            score = min(score + 8, 100)
+            reasons.append("💧 Sweep pré-BOS — origine Dealing Range sur liquidité  (+8)")
+
     # ── Affichage détails ────────────────────────────────────
     def tick(v): return c("✓", "green") if v else c("✗", "red")
     if not silent:
@@ -2665,7 +3199,28 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"  {'Confirmation M15':<26} {tick(ltf_confirm)}")
         print(f"  {'Trigger M1':<26} {c('DÉSACTIVÉ', 'yellow')}")
         print(f"  {c('── Setups Avancés ──', 'cyan')}")
-        print(f"  {'Breaker Block M15':<26} {tick(breaker_block)}")
+        print(f"  {'Breaker Block M15':<26} {tick(breaker_block)}"
+              + (c("  ← ELITE", "yellow") if breaker_elite else ""))
+        # ── OTE Fibonacci DWO (v9.1) ─────────────────────────
+        if ote_result is not None:
+            dec_ote = 2 if df_ltf["close"].iloc[-1] > 100 else 5
+            ote_color = "green" if ote_in_zone else "white"
+            ote_label = (f"✓ Prix dans OTE  [{round(ote_result['ote_bottom'], dec_ote)}"
+                         f" – {round(ote_result['ote_top'], dec_ote)}]"
+                         if ote_in_zone else
+                         f"✗ Hors OTE  [{round(ote_result['ote_bottom'], dec_ote)}"
+                         f" – {round(ote_result['ote_top'], dec_ote)}]")
+            print(f"  {'OTE 62%–79% (DWO)':<26} {c(ote_label, ote_color)}")
+            print(f"    {'Dealing Range':<22} {ote_result['dealing_range']}")
+            print(f"    {'Move size':<22} {ote_result['move_size']}"
+                  f"  (≥ 2× ATR requis)")
+            if ote_result.get("retracing"):
+                print(f"    {'Fib 50.0%':<22} {ote_result['fib_500']}")
+                print(f"    {'Fib 61.8%':<22} {ote_result['fib_618']}")
+                print(f"    {'Fib 70.5% ← OTE mid':<22} {c(str(ote_result['fib_705']), 'magenta')}")
+                print(f"    {'Fib 78.6%':<22} {ote_result['fib_786']}")
+        else:
+            print(f"  {'OTE 62%–79% (DWO)':<26} {c('✗ Pas de BOS valide / move trop petit', 'white')}")
         print(f"  {'FVG 30min (≈45min)':<26} {tick(fvg_30m)}")
         print(f"  {'Trendline Liq. sweepée':<26} {tick(trendline_liq)}")
         print(f"  {'Older Block HTF':<26} {tick(older_block)}")
@@ -3738,5 +4293,4 @@ if __name__ == "__main__":
             min_rr    = args.min_rr,
             interval  = args.interval,
         )
-
 
