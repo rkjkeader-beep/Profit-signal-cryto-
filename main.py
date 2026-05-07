@@ -1,104 +1,81 @@
 
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║          SMC SIGNAL ENGINE  v9.2  — Smart Money Concepts PRO        ║
-║   BOS · FVG · Order Block · Breaker Block · OTE · H1→M15→M5        ║
+║          SMC SIGNAL ENGINE  v11  — Smart Money Concepts PRO         ║
+║   BOS · FVG · OB · Breaker Block · OTE DWO · Clean PA · AMD · D1   ║
+║   BTC/GOLD PRIORITY  |  TREND FOLLOWING D1  |  AMD CYCLE DETECTOR   ║
 ║                                                                      ║
 ║   FOREX  |  INDICES  |  CRYPTO  |  COMMODITIES  |  MATIERES 1ERES   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-Nouveautes v9.2 — BOS QUALIFIÉ + OTE ANCRÉ SUR SWEEP :
+Nouveautes v11 — AMD CYCLE + TENDANCE DE FOND + BTC/GOLD PRIORITE :
 
-  BOS QUALIFIÉ (detect_bos) :
-    Deux filtres ajoutés sur chaque BOS détecté :
+  1. TENDANCE DE FOND D1 (Daily Trend Filter) :
+       daily_trend() → EMA50 + structure HH/HL sur Daily
+       Signal ALIGNÉ D1   : +12 pts bonus
+       Signal CONTRE D1   : BLOQUÉ — pas d'entrée counter-trend
+       Neutre (NEUTRAL)   : pas d'impact, signal passe normalement
 
-    • DISPLACEMENT : la bougie de cassure doit avoir un corps ≥ 40% de
-      son range total. Élimine les doji, spinning tops et cassures sur
-      bruit de marché (~30-40% des faux BOS filtrés).
+  2. AMD CYCLE DETECTOR :
+       detect_amd_cycle() → analyse sur H1 (AMD) + M15 (Manipulation)
+       ACCUMULATION (≥70%) : signal BLOQUÉ (range = entrée risquée)
+       MANIPULATION (≥60%) : +15 pts  ← meilleur moment d'entrée
+       DISTRIBUTION (≥55%) : +10 pts si dans le sens du move
+       Phase AMD affichée dans le message Telegram avec badge dédié
 
-    • SWEEP PRÉ-BOS : détecte si dans les 5 bougies avant le BOS le
-      prix a spiké au-delà du swing puis est revenu (stop hunt).
-      → flag "swept" = True dans le dict BOS
-      → niveau du spike disponible comme ancrage alternatif
+  3. BTC + GOLD PRIORITE ABSOLUE :
+       Quel que soit le mode (forex/all/priority),
+       BTC-USD et GC=F sont TOUJOURS scannés EN PREMIER.
+       Positionnés en tête de liste à chaque cycle.
 
-  OTE ANCRÉ SUR LIQUIDITY SWEEP (detect_ote_zone) :
-    Si le BOS ancrant le dealing range est précédé d'un sweep :
-    → L'origine du fibo est recalée sur le niveau du spike
-      (plus bas/haut réel pris par les institutionnels)
-    → Dealing range plus précis = niveaux OTE plus propres
+  CYCLE DE VIE COMPLET v11 :
+    D1 trend aligné → AMD Phase M ou D → BOS propre
+    → Clean PA → OTE/OB → M5 trigger → ENTRY ✅
 
-  FVG DANS LE MOVE (detect_ote_zone) :
-    Le move impulsif doit contenir au moins 1 FVG dans son sens.
-    → "has_fvg": True dans le retour de detect_ote_zone
-    → Utilisable pour bonus score dans analyse() :
-       if ote.get("has_fvg"): score += 10  (displacement confirmé)
-    → Un move sans FVG = probable range étendu ou manipulation
+Nouveautes v10 — CLEAN PA MODULE (fusion smc_clean_pa_v1) :
 
-  Nouveaux champs dans le retour de detect_ote_zone :
-    "has_fvg"          : bool  — FVG dans le move impulsif
-    "bos_swept"        : bool  — sweep de liquidité avant le BOS
-    "bos_displacement" : float — ratio corps/range bougie de cassure
+  CLEAN PA FILTER (4 axes) :
+    1. STRUCTURE   — HH/HL ou LH/LL clairs (pas de zigzag)
+    2. DISPLACEMENT— Vraie impulsion forte avant la zone (CRITIQUE)
+    3. PULLBACK    — Retour calme dans la zone (pas chaotique)
+    4. CHOP FILTER — Bloque les marchés sans direction
 
-Nouveautes v9 — OTE FIBONACCI + BREAKER BLOCK ELITE :
+  CYCLE DE VIE D'UN SIGNAL CLEAN :
+    DISPLACEMENT fort → BOS propre → PULLBACK calme → Confirmation → ENTRY ✅
 
-  OTE FIBONACCI RÉEL (NOUVEAU) :
-    detect_ote_fibonacci() → zone 62%–79% du dernier move impulsif M15
-    Identique à la logique ICT : swing bas → swing haut (LONG) ou inverse
-    • Prix dans OTE = setup A+ institutionnel
-    • Bonus score +12 si prix dans OTE
-    • Bonus score +8 additionnel si OTE + OB confluence
-    • Bonus score +10 si OTE + FVG confluence (setup sniper triple)
+  SCORING CLEAN PA :
+    PA parfait  (score ≥8) : +15 pts
+    PA propre   (score ≥6) : +8 pts
+    PA ok       (score ≥5) : +3 pts
+    Choppy            : −5 pts  (pénalité directe)
+    Pas de displacement : −8 pts (bloquant)
 
-  BREAKER BLOCK ELITE (AMÉLIORÉ) :
-    detect_breaker_blocks() → logique de flip complète et vérifiée
-    • Ancien OB bullish cassé par BOS bearish → Breaker SELL confirmé
-    • Ancien OB bearish cassé par BOS bullish → Breaker BUY confirmé
-    • Vérification que le prix EST dans la zone au moment du signal
-    • Bonus score +18 (était +12) — Breaker > OB classique
-    • Label distinct dans Telegram : 🔥 BREAKER BLOCK ELITE
+  BLOCAGE AUTOMATIQUE :
+    clean_score < 5 OU pas de displacement → signal rejeté (return None)
+
+Nouveautes v9 — OTE FIBONACCI DWO + BREAKER BLOCK ELITE :
+
+  OTE FIBONACCI RÉEL :
+    detect_ote_zone() → ancré sur BOS réel (Dealing Range DWO)
+    Move ≥ 2× ATR obligatoire — exclut ranges et micro-structures
+    Bonus score +12 si prix dans OTE 62%–79%
+    Bonus score +8 additionnel si OTE + OB confluence
+    Bonus score +10 si OTE + FVG confluence (setup sniper triple)
+
+  BREAKER BLOCK ELITE :
+    detect_breaker_blocks() → 3 conditions strictes
+    • BOS a physiquement traversé l'OB
+    • Prix actuel dans la zone (retest confirmé)
+    • Bonus score +18 — Breaker > OB classique
 
 Nouveautes v8 — LOGIQUE INSTITUTIONNELLE REELLE :
 
   ARCHITECTURE TRIPOLAIRE (H1 → M15 → M5) :
     H1  → BIAIS directionnel (macro)
-    M15 → ZONE institutionnelle (OB / FVG / Liquidity) — confirmation OBLIGATOIRE
-    M5  → TRIGGER d'entrée précis — OBLIGATOIRE (bloque si absent)
+    M15 → ZONE institutionnelle (OB / FVG / Liquidity)
+    M5  → TRIGGER d'entrée précis — OBLIGATOIRE
 
-  FILTRE MARCHE (NOUVEAU) :
-    market_condition() → détecte TREND vs RANGE sur M15
-    • En RANGE : OB bloqués, seuls les sweeps de range extrêmes autorisés
-    • En TREND  : pipeline complet actif
-
-  ZONE FRAÎCHE OBLIGATOIRE (NOUVEAU) :
-    is_zone_fresh() → vérifie que le prix n'a PAS déjà traversé la zone
-    • OB mitiqué = zone invalidée → signal rejeté
-    • FVG déjà traversé = zone morte → ignoré
-
-  M5 TRIGGER OBLIGATOIRE (NOUVEAU) :
-    Le signal M15 seul ne suffit plus.
-    Entrée = close bougie M5 confirmée OU rejet immédiat.
-    Bonus score +10 si M5 trigger aligné avec M15 structure.
-
-  PATTERNS DE CONFIRMATION — 10 patterns institutionnels :
-    M15 (zone) + M5 (trigger) :
-      1.  Bullish / Bearish Engulfing (corps x1.3 minimum)
-      2.  Morning Star / Evening Star (3 bougies, recupere 50% B-2)
-      3.  Pin Bar de rejet (meche 2.5x corps, corps dans 1/3 oppose)
-      4.  Dragonfly / Gravestone Doji (corps < 5% range)
-      5.  Tweezer Bottom / Top (double test, tolerance ATR x0.2)
-      6.  Three White Soldiers / Three Black Crows (3 bougies solides)
-      7.  Hammer / Hanging Man (corps compact + meche 2x)
-      8.  Shooting Star / Inverted Hammer (meche 3x corps)
-      9.  Harami (corps interne a la bougie precedente)
-     10.  Inside Bar Break (compression puis expansion)
-
-  SESSIONS ET ANTI-MANIPULATION :
-    Fenetres autorisees : London 07-10h UTC, NY 13-17h UTC
-    Bloquees : pre-London, mid-London dull, post-NY, Asie, nuit
-    Fenetres news : avertissement ⚠ dans signal Telegram (non bloquant)
-
-  RR MINIMUM : 3.0 (filtre elite inchange)
-  SCORE MINIMUM : 80/100
+  RR MINIMUM : 3.0  |  SCORE MINIMUM : 80/100
 
   Marchés couverts :
     FOREX      — 28 paires majeures + mineures + exotiques
@@ -106,16 +83,11 @@ Nouveautes v8 — LOGIQUE INSTITUTIONNELLE REELLE :
     INDICES    — SPX, NAS, DAX, CAC, FTSE, Nikkei, HSI
     COMMODITÉS — Gold, Silver, Oil WTI, Oil Brent, Gaz Naturel, Cuivre
 
-  Installation :
-    pip install yfinance pandas numpy colorama tabulate flask requests
-
   Usage :
-    python smc_signals_v8.py                       # scan complet
-    python smc_signals_v8.py --cat forex           # seulement forex
-    python smc_signals_v8.py --cat crypto          # seulement crypto
-    python smc_signals_v8.py --cat commodities     # gold/pétrole/...
-    python smc_signals_v8.py --symbol EURUSD=X     # symbol unique
-    python smc_signals_v8.py --min-score 80        # filtre score élevé
+    python smc_signals_v11.py                       # scan complet
+    python smc_signals_v11.py --cat forex
+    python smc_signals_v11.py --symbol EURUSD=X
+    python smc_signals_v11.py --min-score 80
 """
 
 import argparse
@@ -348,11 +320,23 @@ ATR_MIN: dict[str, float] = {
     # Crypto
     "BTC-USD":  200.0,
     "ETH-USD":  10.0,
+    "SOL-USD":  0.50,
+    "BNB-USD":  0.50,
+    "XRP-USD":  0.003,
+    "ADA-USD":  0.002,
+    "AVAX-USD": 0.20,
+    "LINK-USD": 0.05,
+    "DOGE-USD": 0.001,
+    "LTC-USD":  0.30,
     # Indices
     "^GSPC":    8.0,
     "^NDX":     30.0,
     "^DJI":     80.0,
     "^GDAXI":   40.0,
+    "^FCHI":    15.0,
+    "^FTSE":    15.0,
+    "^N225":    80.0,
+    "^HSI":     80.0,
 }
 ATR_MIN_DEFAULT = 0.00050  # fallback pour symboles non listés
 
@@ -386,6 +370,47 @@ SENSITIVE_WINDOWS_UTC: list[tuple[int, int, int, int, str]] = [
 # Ratio spread/ATR max
 MAX_SPREAD_ATR_RATIO = 0.25
 
+# ─────────────────────────────────────────────────────────────
+#  v10 — CLEAN PA FILTER (fusion smc_clean_pa_v1)
+# ─────────────────────────────────────────────────────────────
+CLEAN_MIN_SCORE           = 5      # clean_score < 5 → signal bloqué
+CLEAN_DISPLACEMENT_BODY   = 1.5    # corps > avg_body × 1.5 = impulsion forte
+CLEAN_DISPLACEMENT_CONSEC = 2      # N bougies consécutives minimum
+CLEAN_DISPLACEMENT_ATR    = 1.1    # corps > 110% ATR = Marubozu/displacement
+CLEAN_CHOP_ALT_RATIO      = 0.62   # 62% alternance couleurs = choppy
+CLEAN_CHOP_BODY_RATIO     = 0.38   # body/range moyen < 38% = indécision
+CLEAN_CHOP_WINDOW         = 12     # fenêtre bougies pour analyse chop
+CLEAN_PULLBACK_BODY_MAX   = 0.75   # corps pullback < 75% avg_body = calme
+CLEAN_PULLBACK_WINDOW     = 8      # bougies max à analyser dans le pullback
+CLEAN_STRUCTURE_MIN_SWINGS = 2     # swings HH/HL ou LH/LL minimum
+
+# ─────────────────────────────────────────────────────────────
+#  v10 — SEUILS CLEAN PA ADAPTATIFS PAR INSTRUMENT
+#
+#  Gold et BTC ont des bougies beaucoup plus grandes que le Forex.
+#  Un "displacement" Gold = 1.5–2$ de corps sur M15.
+#  Si on applique les mêmes ratios qu'en Forex → trop de faux positifs
+#  ou au contraire tout est bloqué.
+#
+#  Solution : override des seuils par groupe d'instruments.
+# ─────────────────────────────────────────────────────────────
+# Symboles nécessitant des seuils adaptés (haute volatilité)
+CLEAN_PA_HIGH_VOL = frozenset({
+    "GC=F", "SI=F", "CL=F", "BZ=F", "NG=F", "HG=F", "PL=F", "PA=F",  # commodités
+    "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD",              # crypto
+    "^GSPC", "^NDX", "^DJI", "^GDAXI", "^FCHI", "^FTSE", "^N225",      # indices
+})
+# Seuils haute volatilité — plus permissifs sur l'alternance chop
+# (Gold alterne naturellement plus que l'EURUSD)
+CLEAN_CHOP_ALT_RATIO_HV   = 0.72   # tolérance alternance élevée pour or/btc
+CLEAN_CHOP_BODY_RATIO_HV  = 0.30   # body/range min plus faible (bougies à mèches)
+CLEAN_DISPLACEMENT_ATR_HV = 0.90   # displacement = 0.9× ATR suffit sur Gold/BTC
+
+# Fréquence de scan prioritaire Tier 1 (Gold/BTC/Indices)
+# TIER_1_SCAN_EVERY_N = 1 → chaque cycle
+# TIER_1_SCAN_EVERY_N = 2 → un cycle sur deux intercalé
+TIER_1_SCAN_EVERY_N = 1   # Gold/BTC scannés à CHAQUE cycle (déjà en tête)
+
 
 def is_session_active(symbol: str = "") -> bool:
     """
@@ -401,7 +426,8 @@ def is_session_active(symbol: str = "") -> bool:
     """
     now = datetime.now(timezone.utc)
 
-    # BTC → scan continu, y compris week-end
+    # Crypto → BTC-USD uniquement autorisé 24h/24, 7j/7 (week-end inclus)
+    # Les autres cryptos suivent les mêmes restrictions que le Forex le week-end.
     if symbol == "BTC-USD":
         return True
 
@@ -583,6 +609,14 @@ SPREAD_TABLE: dict[str, float] = {
     # ── Crypto ───────────────────────────────────────────────
     "BTC-USD":  15.0,      # ~$15 spread moyen
     "ETH-USD":  0.80,
+    "SOL-USD":  0.05,
+    "BNB-USD":  0.10,
+    "XRP-USD":  0.0003,
+    "ADA-USD":  0.0002,
+    "AVAX-USD": 0.05,
+    "LINK-USD": 0.01,
+    "DOGE-USD": 0.0001,
+    "LTC-USD":  0.05,
     # ── Indices (valeur indice) ───────────────────────────────
     "^GSPC":    0.30,
     "^NDX":     0.50,
@@ -696,55 +730,23 @@ _signal_cache: dict[str, float] = {}   # clé → timestamp dernier envoi
 _setup_sent: dict[str, float] = {}    # clé → timestamp d'envoi
 SETUP_TTL = 1800                       # 30 min — après ça, re-send autorisé si setup toujours actif
 
-# Cooldown par paire : bloque tout nouveau signal sur la même paire
-# pendant N secondes après un envoi, quelle que soit la direction.
-# Évite le flood sur la même zone (3 signaux même range).
-PAIR_COOLDOWN = 1800   # 30 min
-_pair_last_signal: dict[str, float] = {}   # symbol → timestamp dernier envoi
+def _setup_key(symbol: str, direction: str, sl: float) -> str:
+    """Clé unique de setup : paire + direction + SL arrondi à 3 décimales significatives."""
+    sl_rounded = round(sl, 3) if sl > 10 else round(sl, 5)
+    return f"{symbol}:{direction}:{sl_rounded}"
 
-
-def _setup_key(symbol: str, direction: str, entry: float, sl: float) -> str:
-    """
-    Clé unique de setup — v9.3 : triple critère.
-
-    Avant (v9.2) : basé sur SL uniquement → deux setups avec même SL
-    mais entrées différentes étaient dédupliqués à tort.
-
-    Maintenant :
-      symbol + direction + entry arrondi + SL arrondi
-      → deux OB proches avec même SL mais prix différents = deux setups distincts
-      → même setup renvoyé 2× dans les 30 min = bloqué
-    """
-    dec = 1 if entry > 100 else 4   # Gold/indices → 1 décimale, Forex → 4
-    entry_r = round(entry, dec)
-    sl_r    = round(sl,    dec)
-    return f"{symbol}:{direction}:e{entry_r}:sl{sl_r}"
-
-
-def is_setup_already_sent(symbol: str, direction: str, sl: float,
-                           entry: float = 0.0) -> bool:
-    # ── Check 1 : cooldown par paire (anti-flood même zone) ──
-    now_ts = time.time()
-    if symbol in _pair_last_signal:
-        elapsed = now_ts - _pair_last_signal[symbol]
-        if elapsed < PAIR_COOLDOWN:
-            return True   # paire en cooldown → bloqué
-
-    # ── Check 2 : même setup exact (entry + SL + direction) ──
-    key = _setup_key(symbol, direction, entry, sl)
+def is_setup_already_sent(symbol: str, direction: str, sl: float) -> bool:
+    key = _setup_key(symbol, direction, sl)
     if key not in _setup_sent:
         return False
-    if now_ts - _setup_sent[key] > SETUP_TTL:
+    # Expire après SETUP_TTL
+    if time.time() - _setup_sent[key] > SETUP_TTL:
         del _setup_sent[key]
         return False
     return True
 
-
-def mark_setup_sent(symbol: str, direction: str, sl: float,
-                    entry: float = 0.0) -> None:
-    now_ts = time.time()
-    _setup_sent[_setup_key(symbol, direction, entry, sl)] = now_ts
-    _pair_last_signal[symbol] = now_ts   # démarre le cooldown paire
+def mark_setup_sent(symbol: str, direction: str, sl: float) -> None:
+    _setup_sent[_setup_key(symbol, direction, sl)] = time.time()
 
 def reset_setup(symbol: str) -> None:
     """Réinitialise les setups d'un symbole (appeler si le biais H1 change)."""
@@ -833,17 +835,40 @@ def tg_format_signal(sig: "Signal", tier: str = "") -> str:
     else:
         warning_banner = ""
 
-    # ── Badges setup (OTE / Breaker Elite) ───────────────────
+    # ── Badges setup (OTE / Breaker Elite / Clean PA / AMD) ────────
     setup_badges = ""
     has_breaker = any("BREAKER BLOCK ELITE" in r or "Breaker Block" in r
                       for r in sig.reasons)
     has_ote     = any("OTE Fibonacci" in r for r in sig.reasons)
+    has_pa_perfect = any("PRICE ACTION PARFAIT" in r for r in sig.reasons)
+    has_pa_clean   = any("PRICE ACTION PROPRE" in r for r in sig.reasons)
+    has_displacement = any("Impulsion" in r for r in sig.reasons)
+    has_amd_manip  = any("AMD — Phase Manipulation" in r for r in sig.reasons)
+    has_amd_dist   = any("AMD — Phase Distribution" in r for r in sig.reasons)
+    has_d1_aligned = any("Tendance D1" in r for r in sig.reasons)
+
     if has_breaker and has_ote:
-        setup_badges = "🔥 <b>BREAKER BLOCK ELITE + OTE DWO</b> — Setup A+ institutionnel\n"
+        setup_badges += "🔥 <b>BREAKER BLOCK ELITE + OTE DWO</b> — Setup A+ institutionnel\n"
     elif has_breaker:
-        setup_badges = "🔥 <b>BREAKER BLOCK ELITE</b> — Zone flippée retestée\n"
+        setup_badges += "🔥 <b>BREAKER BLOCK ELITE</b> — Zone flippée retestée\n"
     elif has_ote:
-        setup_badges = "📐 <b>OTE 62%–79% (DWO)</b> — Dealing Range Fibonacci\n"
+        setup_badges += "📐 <b>OTE 62%–79% (DWO)</b> — Dealing Range Fibonacci\n"
+
+    if has_pa_perfect:
+        setup_badges += "💎 <b>PRICE ACTION INSTITUTIONNEL</b> — Displacement + Structure + Pullback\n"
+    elif has_pa_clean:
+        setup_badges += "🎯 <b>PRICE ACTION PROPRE</b> — Setup lisible et propre\n"
+    elif not has_displacement:
+        setup_badges += "⚠️ <i>Zone sans impulsion confirmée</i>\n"
+
+    # ── Badges AMD + D1 trend ────────────────────────────────
+    if has_amd_manip:
+        setup_badges += "🔄 <b>AMD — PHASE MANIPULATION</b> — Stop hunt + retour dans le range\n"
+    elif has_amd_dist:
+        setup_badges += "🔄 <b>AMD — PHASE DISTRIBUTION</b> — Move impulsif post-manipulation\n"
+    if has_d1_aligned:
+        d1_dir = "BULLISH" if "BULLISH" in next((r for r in sig.reasons if "Tendance D1" in r), "") else "BEARISH"
+        setup_badges += f"📅 <b>TENDANCE D1 {d1_dir}</b> — Trade dans le sens du fond\n"
 
     msg = (
         f"<b>⚡ SMC SIGNAL ELITE  —  {tier_badge}</b>\n"
@@ -888,12 +913,12 @@ def tg_notify(sig: "Signal", tier: str = "", chat_id: Optional[str] = None) -> N
         log.warning(f"  [TG] ⛔ BLOQUÉ — SL trop serré (distance < 0.3 pip)")
         return
 
-    # ── Guard 2 : Déduplication entry+SL+direction + cooldown paire (v9.3) ──
-    if is_setup_already_sent(sig.symbol, sig.direction, sig.sl, sig.entry):
-        print(c(f"  [TG] ⏭ Setup dupliqué ou paire en cooldown — "
-                f"{sig.symbol} {sig.direction} entry={sig.entry} SL={sig.sl} — ignoré.", "yellow"))
+    # ── Guard 2 : Déduplication par SL (même setup = même SL) ──
+    if is_setup_already_sent(sig.symbol, sig.direction, sig.sl):
+        print(c(f"  [TG] ⏭ Setup déjà envoyé — {sig.symbol} {sig.direction} "
+                f"SL={sig.sl} — ignoré.", "yellow"))
         return
-    mark_setup_sent(sig.symbol, sig.direction, sig.sl, sig.entry)
+    mark_setup_sent(sig.symbol, sig.direction, sig.sl)
 
     # ── Résolution chat_id personnel ──────────────────────────
     cid = chat_id or TELEGRAM_CHAT_ID
@@ -1055,6 +1080,461 @@ class Signal:
     risk_usd    : float = RISK_USD
     reasons     : list = field(default_factory=list)
 
+
+# ─────────────────────────────────────────────────────────────
+#  v10 — CLEAN PA CONTEXT (fusion smc_clean_pa_v1)
+# ─────────────────────────────────────────────────────────────
+@dataclass
+class CleanPAContext:
+    """
+    Résultat de l'analyse qualité Price Action (Clean PA).
+
+    Évalue la propreté du marché sur 4 dimensions :
+      1. STRUCTURE    — HH/HL ou LH/LL clairs (pas de zigzag)
+      2. DISPLACEMENT — Vraie impulsion forte avant la zone (CRITIQUE)
+      3. LIQUIDITÉ    — Equal highs/lows sweepés avant le move
+      4. PULLBACK     — Retour calme dans la zone (pas chaotique)
+      + CHOP FILTER   — Bloque les marchés sans direction
+
+    clean_score ≥ CLEAN_MIN_SCORE ET displacement_ok → signal autorisé
+    Sinon → return None dans analyse()
+    """
+    structure_ok      : bool  = False
+    swing_count       : int   = 0
+    structure_type    : str   = ""
+    displacement_ok   : bool  = False
+    impulse_strength  : float = 0.0
+    impulse_consec    : int   = 0
+    bars_since_impulse: int   = 0
+    liquidity_swept   : bool  = False
+    sweep_level       : float = 0.0
+    sweep_type        : str   = ""
+    pullback_ok       : bool  = False
+    pullback_quality  : float = 0.0
+    pullback_bars     : int   = 0
+    is_choppy         : bool  = False
+    chop_score        : float = 0.0
+    chop_reason       : str   = ""
+
+    @property
+    def clean_score(self) -> int:
+        s = 0
+        if self.structure_ok    : s += 2
+        if self.displacement_ok : s += 3
+        if self.liquidity_swept : s += 2
+        if self.pullback_ok     : s += 2
+        if self.is_choppy       : s -= 3
+        return max(s, 0)
+
+    @property
+    def is_valid(self) -> bool:
+        return self.clean_score >= CLEAN_MIN_SCORE and self.displacement_ok
+
+    @property
+    def label(self) -> str:
+        s = self.clean_score
+        if s >= 8 : return "PRICE ACTION PARFAIT — Setup A+"
+        if s >= 6 : return "PRICE ACTION PROPRE — Setup B+"
+        if s >= CLEAN_MIN_SCORE : return "PRICE ACTION ACCEPTABLE"
+        return "PRICE ACTION INSUFFISANT — Bloqué"
+
+    @property
+    def bonus_score(self) -> int:
+        s = self.clean_score
+        if s >= 8 : return 15
+        if s >= 6 : return 8
+        if s >= CLEAN_MIN_SCORE : return 3
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────
+#  v10 — FONCTIONS CLEAN PA
+# ─────────────────────────────────────────────────────────────
+
+def detect_market_structure_quality(df: pd.DataFrame,
+                                     direction: str,
+                                     lookback: int = 40) -> dict:
+    """HH/HL ou LH/LL clairs sur les N dernières bougies."""
+    result = {"found": False, "swing_count": 0, "structure_type": "UNCLEAR"}
+    if len(df) < 20:
+        return result
+
+    window = df.iloc[-lookback:-1]
+    highs, lows = [], []
+    for i in range(2, len(window) - 2):
+        h = window["high"].iloc[i]
+        l = window["low"].iloc[i]
+        if (h > window["high"].iloc[i-1] and h > window["high"].iloc[i-2]
+                and h > window["high"].iloc[i+1] and h > window["high"].iloc[i+2]):
+            highs.append((i, h))
+        if (l < window["low"].iloc[i-1]  and l < window["low"].iloc[i-2]
+                and l < window["low"].iloc[i+1] and l < window["low"].iloc[i+2]):
+            lows.append((i, l))
+
+    if len(highs) < 2 or len(lows) < 2:
+        return result
+
+    hh_hl_count, lh_ll_count = 0, 0
+    for i in range(1, len(highs)):
+        if highs[i][1] > highs[i-1][1]: hh_hl_count += 1
+        if highs[i][1] < highs[i-1][1]: lh_ll_count += 1
+    for i in range(1, len(lows)):
+        if lows[i][1] > lows[i-1][1]: hh_hl_count += 1
+        elif lows[i][1] < lows[i-1][1]: lh_ll_count += 1
+
+    if direction == "LONG":
+        swing_count = hh_hl_count
+        struct_type = "BULLISH_TREND" if swing_count >= CLEAN_STRUCTURE_MIN_SWINGS else "UNCLEAR"
+    else:
+        swing_count = lh_ll_count
+        struct_type = "BEARISH_TREND" if swing_count >= CLEAN_STRUCTURE_MIN_SWINGS else "UNCLEAR"
+
+    found = swing_count >= CLEAN_STRUCTURE_MIN_SWINGS
+    result.update({"found": found, "swing_count": swing_count, "structure_type": struct_type})
+    return result
+
+
+def detect_displacement(df: pd.DataFrame, direction: str, lookback: int = 15) -> dict:
+    """
+    Détecte une vraie impulsion forte récente (critère le plus important).
+    Critère A : corps > avg_body × 1.5 pendant N bougies consécutives.
+    Critère B : une seule bougie avec corps > ATR × 1.1 (Marubozu).
+    """
+    result = {"found": False, "strength": 0.0, "consec": 0, "bars_ago": 99}
+    if len(df) < 15:
+        return result
+
+    window   = df.iloc[-(lookback + 5):-1]
+    n        = len(window)
+    atr      = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr) or atr <= 0:
+        return result
+
+    bodies   = abs(window["close"] - window["open"])
+    avg_body = bodies.mean()
+    if avg_body <= 0:
+        return result
+
+    is_bull_dir   = (direction == "LONG")
+    best_strength = 0.0
+    best_consec   = 0
+    best_bars_ago = 99
+
+    for i in range(n - 1, -1, -1):
+        is_bull = window["close"].iloc[i] > window["open"].iloc[i]
+        body    = bodies.iloc[i]
+        strength = body / atr if atr > 0 else 0
+
+        if (is_bull_dir != is_bull):
+            continue
+
+        if body > atr * CLEAN_DISPLACEMENT_ATR:
+            consec = 1
+            for j in range(i - 1, max(i - 5, -1), -1):
+                if (window["close"].iloc[j] > window["open"].iloc[j]) == is_bull_dir:
+                    consec += 1
+                else:
+                    break
+            bars_ago = n - 1 - i
+            if strength > best_strength:
+                best_strength, best_consec, best_bars_ago = strength, consec, bars_ago
+
+        elif body > avg_body * CLEAN_DISPLACEMENT_BODY:
+            consec = 1
+            for j in range(i - 1, max(i - CLEAN_DISPLACEMENT_CONSEC - 2, -1), -1):
+                b_is_bull = window["close"].iloc[j] > window["open"].iloc[j]
+                b_body    = abs(window["close"].iloc[j] - window["open"].iloc[j])
+                if b_is_bull == is_bull_dir and b_body > avg_body:
+                    consec += 1
+                else:
+                    break
+            if consec >= CLEAN_DISPLACEMENT_CONSEC:
+                bars_ago = n - 1 - i
+                if strength > best_strength:
+                    best_strength, best_consec, best_bars_ago = strength, consec, bars_ago
+
+    found = (
+        best_strength >= CLEAN_DISPLACEMENT_ATR
+        or (best_consec >= CLEAN_DISPLACEMENT_CONSEC
+            and best_strength >= CLEAN_DISPLACEMENT_BODY * 0.8)
+    )
+    if found:
+        result.update({"found": True, "strength": round(best_strength, 2),
+                        "consec": best_consec, "bars_ago": best_bars_ago})
+    return result
+
+
+def detect_choppy_market(df: pd.DataFrame,
+                          window_size: int = CLEAN_CHOP_WINDOW) -> dict:
+    """
+    3 signaux de chop : alternance couleurs, corps/range faible, range total faible.
+    2/3 critères confirmés = marché choppy → signal bloqué.
+    """
+    result = {"is_choppy": False, "chop_score": 0.0, "reason": ""}
+    if len(df) < window_size + 5:
+        return result
+
+    window = df.iloc[-(window_size + 3):-1]
+    n      = len(window)
+    chop_signals = []
+
+    colors = [window["close"].iloc[i] > window["open"].iloc[i] for i in range(n)]
+    alternations = sum(1 for i in range(1, n) if colors[i] != colors[i-1])
+    alt_ratio = alternations / max(n - 1, 1)
+    if alt_ratio >= CLEAN_CHOP_ALT_RATIO:
+        chop_signals.append(f"alternance {round(alt_ratio*100)}%")
+
+    bodies = abs(window["close"] - window["open"])
+    ranges = window["high"] - window["low"]
+    body_ratio_mean = (bodies / ranges.replace(0, np.nan)).mean()
+    if pd.isna(body_ratio_mean):
+        body_ratio_mean = 0.5
+    if body_ratio_mean < CLEAN_CHOP_BODY_RATIO:
+        chop_signals.append(f"body/range={round(body_ratio_mean, 2)}")
+
+    atr = (window["high"] - window["low"]).rolling(7).mean().iloc[-1]
+    total_range = window["high"].max() - window["low"].min()
+    if not np.isnan(atr) and atr > 0:
+        range_vs_atr = total_range / atr
+        if range_vs_atr < 2.0:
+            chop_signals.append(f"range={round(range_vs_atr, 1)}×ATR")
+
+    chop_score = len(chop_signals) / 3.0
+    is_choppy  = len(chop_signals) >= 2
+    result.update({
+        "is_choppy" : is_choppy,
+        "chop_score": round(chop_score, 2),
+        "reason"    : " | ".join(chop_signals) if chop_signals else "clean",
+    })
+    return result
+
+
+def detect_clean_pullback(df: pd.DataFrame, direction: str,
+                           zone_high: float, zone_low: float) -> dict:
+    """
+    Pullback propre = retour calme dans la zone (petites bougies, pas de
+    contre-impulsion violente). quality ≥ 0.45 ET violent_counter ≤ 1 → valide.
+    """
+    result = {"found": False, "quality": 0.0, "bars": 0}
+    if len(df) < 10 or zone_high <= zone_low:
+        return result
+
+    window  = df.iloc[-(CLEAN_PULLBACK_WINDOW + 3):-1]
+    n       = len(window)
+    price   = df["close"].iloc[-1]
+    atr     = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr) or atr <= 0:
+        return result
+
+    bodies   = abs(window["close"] - window["open"])
+    avg_body = bodies.mean()
+    if avg_body <= 0:
+        return result
+
+    zone_mid  = (zone_high + zone_low) / 2
+    in_zone   = zone_low <= price <= zone_high
+    near_zone = abs(price - zone_mid) <= atr * 1.5
+    if not (in_zone or near_zone):
+        return result
+
+    is_bull_dir     = direction == "LONG"
+    calm_bars       = 0
+    violent_counter = 0
+    for i in range(n):
+        body    = bodies.iloc[i]
+        is_bull = window["close"].iloc[i] > window["open"].iloc[i]
+        if body < avg_body * CLEAN_PULLBACK_BODY_MAX:
+            calm_bars += 1
+        is_counter = (is_bull_dir and not is_bull) or (not is_bull_dir and is_bull)
+        if is_counter and body > avg_body * CLEAN_DISPLACEMENT_BODY:
+            violent_counter += 1
+
+    quality = max(0.0, round(calm_bars / max(n, 1) - violent_counter * 0.3, 2))
+    found   = quality >= 0.45 and violent_counter <= 1
+    result.update({"found": found, "quality": quality, "bars": n})
+    return result
+
+
+def detect_liquidity_sweep_pa(df: pd.DataFrame, direction: str,
+                               lookback: int = 25) -> dict:
+    """
+    Equal highs/lows sweepés récemment = liquidity grab avant le move.
+    SHORT → sweep high évident. LONG → sweep low évident.
+    """
+    result = {"found": False, "level": 0.0, "sweep_type": ""}
+    if len(df) < lookback + 5:
+        return result
+
+    window    = df.iloc[-(lookback + 5):-1]
+    atr       = (window["high"] - window["low"]).rolling(14).mean().iloc[-1]
+    if np.isnan(atr) or atr <= 0:
+        return result
+
+    tolerance = atr * 0.25
+
+    if direction == "SHORT":
+        highs = window["high"].values
+        for i in range(len(highs) - 3):
+            for j in range(i + 2, len(highs)):
+                if abs(highs[i] - highs[j]) <= tolerance:
+                    level = max(highs[i], highs[j])
+                    if df["high"].iloc[-1] > level and df["close"].iloc[-1] < level:
+                        result.update({"found": True, "level": round(level, 5), "sweep_type": "EQH"})
+                        return result
+        swing_high = window["high"].max()
+        if df["high"].iloc[-1] > swing_high and df["close"].iloc[-1] < swing_high:
+            result.update({"found": True, "level": round(swing_high, 5), "sweep_type": "SWING_H"})
+    else:
+        lows = window["low"].values
+        for i in range(len(lows) - 3):
+            for j in range(i + 2, len(lows)):
+                if abs(lows[i] - lows[j]) <= tolerance:
+                    level = min(lows[i], lows[j])
+                    if df["low"].iloc[-1] < level and df["close"].iloc[-1] > level:
+                        result.update({"found": True, "level": round(level, 5), "sweep_type": "EQL"})
+                        return result
+        swing_low = window["low"].min()
+        if df["low"].iloc[-1] < swing_low and df["close"].iloc[-1] > swing_low:
+            result.update({"found": True, "level": round(swing_low, 5), "sweep_type": "SWING_L"})
+
+    return result
+
+
+def detect_clean_pa_context(df: pd.DataFrame, direction: str,
+                              zone_high: float = 0.0,
+                              zone_low:  float = 0.0) -> CleanPAContext:
+    """
+    Orchestrateur Clean PA — évalue les 4 dimensions et retourne un
+    CleanPAContext complet.
+    Appeler dans analyse() APRÈS détection zones (OB/FVG/Breaker)
+    et AVANT compute_score().
+    """
+    ctx = CleanPAContext()
+
+    struct = detect_market_structure_quality(df, direction)
+    if struct["found"]:
+        ctx.structure_ok   = True
+        ctx.swing_count    = struct["swing_count"]
+        ctx.structure_type = struct["structure_type"]
+
+    disp = detect_displacement(df, direction)
+    if disp["found"]:
+        ctx.displacement_ok    = True
+        ctx.impulse_strength   = disp["strength"]
+        ctx.impulse_consec     = disp["consec"]
+        ctx.bars_since_impulse = disp["bars_ago"]
+
+    liq = detect_liquidity_sweep_pa(df, direction)
+    if liq["found"]:
+        ctx.liquidity_swept = True
+        ctx.sweep_level     = liq["level"]
+        ctx.sweep_type      = liq["sweep_type"]
+
+    if zone_high > 0 and zone_low > 0:
+        pull = detect_clean_pullback(df, direction, zone_high, zone_low)
+        if pull["found"]:
+            ctx.pullback_ok      = True
+            ctx.pullback_quality = pull["quality"]
+            ctx.pullback_bars    = pull["bars"]
+
+    chop = detect_choppy_market(df)
+    ctx.is_choppy   = chop["is_choppy"]
+    ctx.chop_score  = chop["chop_score"]
+    ctx.chop_reason = chop["reason"]
+
+    return ctx
+
+
+def _clean_pa_scoring_block(score: int, reasons: list,
+                              clean_ctx: Optional[CleanPAContext]) -> tuple:
+    """
+    Bloc scoring Clean PA — appeler dans compute_score() après AMD, avant return.
+
+    PA parfait  (≥8)  : +15
+    PA propre   (≥6)  : +8
+    PA ok       (≥5)  : +3
+    Choppy            : −5
+    Pas de displacement: −8 (return immédiat)
+    Score < seuil     : −10
+    """
+    if clean_ctx is None:
+        return score, reasons
+
+    if clean_ctx.is_choppy:
+        score = max(score - 5, 0)
+        reasons.append(f"🚫 MARCHÉ CHOPPY — {clean_ctx.chop_reason}  (−5)")
+
+    if not clean_ctx.displacement_ok:
+        score = max(score - 8, 0)
+        reasons.append("⚠️ AUCUNE IMPULSION — Zone sans displacement  (−8)")
+        return score, reasons
+
+    cs = clean_ctx.clean_score
+    if cs >= 8:
+        score = min(score + 15, 100)
+        reasons.append(f"✨ PRICE ACTION PARFAIT — score {cs}/9  (+15)")
+    elif cs >= 6:
+        score = min(score + 8, 100)
+        reasons.append(f"✅ PRICE ACTION PROPRE — score {cs}/9  (+8)")
+    elif cs >= CLEAN_MIN_SCORE:
+        score = min(score + 3, 100)
+        reasons.append(f"🟡 PRICE ACTION ACCEPTABLE — score {cs}/9  (+3)")
+    else:
+        score = max(score - 10, 0)
+        reasons.append(f"❌ PRICE ACTION INSUFFISANT — score {cs}/9  (−10)")
+
+    details = []
+    if clean_ctx.displacement_ok:
+        details.append(f"Impulsion {clean_ctx.impulse_strength}×ATR"
+                       + (f"×{clean_ctx.impulse_consec}b" if clean_ctx.impulse_consec > 1 else ""))
+    if clean_ctx.structure_ok:
+        details.append(f"Structure {clean_ctx.swing_count} swings")
+    if clean_ctx.liquidity_swept:
+        details.append(f"Liq {clean_ctx.sweep_type}")
+    if clean_ctx.pullback_ok:
+        details.append(f"Pullback q={clean_ctx.pullback_quality}")
+    if details:
+        reasons.append("  └ " + " | ".join(details))
+
+    return score, reasons
+
+
+def detect_clean_pa_adaptive(df: pd.DataFrame, direction: str,
+                               symbol: str = "",
+                               zone_high: float = 0.0,
+                               zone_low:  float = 0.0) -> CleanPAContext:
+    """
+    Wrapper adaptatif de detect_clean_pa_context() pour Gold, BTC et hautes
+    volatilités.
+
+    Pour Gold/BTC/Indices/Commodités :
+      • Seuil alternance chop relevé : 0.72 (vs 0.62 Forex) — Gold alterne naturellement plus
+      • Seuil body/range chop abaissé : 0.30 (vs 0.38) — bougies à mèches normales sur Gold
+      • Seuil displacement ATR abaissé : 0.90 (vs 1.10) — impulsion reste forte, ATR réel adapté
+
+    Pour Forex standard : seuils originaux inchangés.
+    """
+    global CLEAN_CHOP_ALT_RATIO, CLEAN_CHOP_BODY_RATIO, CLEAN_DISPLACEMENT_ATR
+
+    is_high_vol = symbol in CLEAN_PA_HIGH_VOL
+
+    if is_high_vol:
+        _orig_alt  = CLEAN_CHOP_ALT_RATIO
+        _orig_body = CLEAN_CHOP_BODY_RATIO
+        _orig_atr  = CLEAN_DISPLACEMENT_ATR
+        CLEAN_CHOP_ALT_RATIO   = CLEAN_CHOP_ALT_RATIO_HV
+        CLEAN_CHOP_BODY_RATIO  = CLEAN_CHOP_BODY_RATIO_HV
+        CLEAN_DISPLACEMENT_ATR = CLEAN_DISPLACEMENT_ATR_HV
+
+    ctx = detect_clean_pa_context(df, direction, zone_high=zone_high, zone_low=zone_low)
+
+    if is_high_vol:
+        CLEAN_CHOP_ALT_RATIO   = _orig_alt
+        CLEAN_CHOP_BODY_RATIO  = _orig_body
+        CLEAN_DISPLACEMENT_ATR = _orig_atr
+
+    return ctx
+
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────
@@ -1107,7 +1587,10 @@ def compute_lot(symbol: str, entry: float, sl: float,
         lot = risk_usd / (sl_distance * 100.0)
 
     # ── Crypto ───────────────────────────────────────────────
-    elif sym in ("BTCUSD", "ETHUSD") or symbol in ("BTC-USD", "ETH-USD"):
+    elif sym in ("BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD",
+                 "ADAUSD", "AVAXUSD", "LINKUSD", "DOGEUSD", "LTCUSD") \
+         or symbol in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD",
+                       "ADA-USD", "AVAX-USD", "LINK-USD", "DOGE-USD", "LTC-USD"):
         lot = round(risk_usd / sl_distance, 6)
         return lot
 
@@ -1189,177 +1672,327 @@ def fetch(symbol: str, interval: str, period: str = "5d",
             return pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────
-#  ANALYSE HTF — BIAIS DIRECTIONNEL  (v9.2 — EMA 50/200)
-#
-#  v9.1 utilisait une EMA 8 sur 20 bougies → trop réactif au bruit.
-#  v9.2 : EMA 50 / EMA 200 — filtre macro classique et stable.
-#
-#  Règle :
-#    EMA50 > EMA200  → BULLISH
-#    EMA50 < EMA200  → BEARISH
-#    Écart < 0.03%   → NEUTRAL (compression = pas de biais clair)
-#
-#  Nécessite ≥ 200 bougies H1 (= 10 jours de données → fetch period="30d").
-#  Si moins de données disponibles → fallback sur EMA 20/50.
+#  ANALYSE HTF — BIAIS DIRECTIONNEL
 # ─────────────────────────────────────────────────────────────
 def htf_bias(df: pd.DataFrame) -> str:
     """
-    Détermine le biais H1 via croisement EMA 50 / EMA 200.
+    Détermine le biais H1 via Higher Highs / Lower Lows (20 dernières bougies).
     Retourne 'BEARISH', 'BULLISH' ou 'NEUTRAL'.
     """
-    if len(df) < 50:
-        return "NEUTRAL"   # pas assez de données
+    highs  = df["high"].iloc[-20:].values
+    lows   = df["low"].iloc[-20:].values
+    closes = df["close"].iloc[-20:].values
 
-    closes = df["close"]
+    # EMA 20 rapide
+    ema = np.convolve(closes, np.ones(8) / 8, mode="valid")
+    trend_up   = closes[-1] > ema[-1]
 
-    # EMA 50 et EMA 200 (ou 50 si pas assez de données)
-    ema_fast = closes.ewm(span=50, adjust=False).mean()
-    if len(df) >= 200:
-        ema_slow = closes.ewm(span=200, adjust=False).mean()
-    else:
-        ema_slow = closes.ewm(span=min(len(df) - 1, 100), adjust=False).mean()
+    # Swing High / Low comparaison
+    last_hh = highs[-1] < highs[-5:].max()    # prix récent sous dernier HH → bearish
+    last_ll  = lows[-1] < lows[-10:].min() * 1.002
 
-    fast_val = ema_fast.iloc[-1]
-    slow_val = ema_slow.iloc[-1]
-
-    # Zone neutre : écart < 0.03% du prix (EMA trop proches = pas de biais)
-    if slow_val == 0:
-        return "NEUTRAL"
-    gap_pct = abs(fast_val - slow_val) / slow_val
-    if gap_pct < 0.0003:
-        return "NEUTRAL"
-
-    if fast_val > slow_val:
+    if not trend_up and last_hh:
+        return "BEARISH"
+    elif trend_up and not last_hh:
         return "BULLISH"
-    return "BEARISH"
+    return "NEUTRAL"
 
 # ─────────────────────────────────────────────────────────────
-#  DÉTECTION BOS — Break of Structure  (v9.2 — displacement + sweep)
+#  v11 — TENDANCE DE FOND D1 (Daily Trend Filter)
 #
-#  Filtres ajoutés vs v9 :
-#    1. DISPLACEMENT : la bougie qui casse doit avoir un corps ≥ 40%
-#       de son range total → exclut les bougies indécises (doji, spinning)
-#       et les cassures sur bruit.
+#  Détermine la tendance macro sur Daily (D1).
+#  Tout signal contre la tendance D1 → pénalité score −15.
+#  Signal dans le sens D1 → bonus +15.
 #
-#    2. SWEEP PRÉ-BOS : vérifie si dans les 5 bougies avant le BOS
-#       le prix a spiké au-delà du swing puis est revenu (stop hunt).
-#       Un BOS précédé d'un sweep = structure institutionnelle réelle.
-#       → flag "swept" = True dans le dict résultat.
-#       → Le fibo sera ancré sur le niveau du sweep, pas juste le low/high.
+#  Méthode : EMA 50 + structure HH/HL (BULLISH) ou LH/LL (BEARISH)
+#  Retourne : 'BULLISH', 'BEARISH', ou 'NEUTRAL'
+# ─────────────────────────────────────────────────────────────
+def daily_trend(df_d1: pd.DataFrame) -> str:
+    """
+    Analyse la tendance de fond sur le timeframe Daily (D1).
+
+    Critères :
+      1. EMA 50 — prix > EMA50 → tendance haussière
+      2. Structure HH/HL sur 14 dernières bougies (BULLISH)
+                 LH/LL sur 14 dernières bougies (BEARISH)
+      3. Les deux doivent concorder pour un biais fort.
+
+    Retourne 'BULLISH', 'BEARISH' ou 'NEUTRAL'.
+    """
+    if df_d1 is None or len(df_d1) < 55:
+        return "NEUTRAL"
+
+    closes = df_d1["close"].values
+    highs  = df_d1["high"].values
+    lows   = df_d1["low"].values
+
+    # EMA 50 simple (convolution)
+    ema50_vals = np.convolve(closes, np.ones(50) / 50, mode="valid")
+    if len(ema50_vals) < 2:
+        return "NEUTRAL"
+    ema50_last = ema50_vals[-1]
+    price_vs_ema = closes[-1] > ema50_last
+
+    # Structure sur les 14 dernières bougies
+    w_h = highs[-14:]
+    w_l = lows[-14:]
+    hh = w_h[-1] > w_h[:-1].max()       # nouveau highest high
+    hl = w_l[-1] > w_l[-7:].min()        # higher low récent
+
+    ll = w_l[-1] < w_l[:-1].min()        # nouveau lowest low
+    lh = w_h[-1] < w_h[-7:].max()        # lower high récent
+
+    if price_vs_ema and (hh or hl):
+        return "BULLISH"
+    if not price_vs_ema and (ll or lh):
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+# ─────────────────────────────────────────────────────────────
+#  v11 — AMD CYCLE DETECTOR
+#  (Accumulation · Manipulation · Distribution)
 #
-#  Note : le filtre displacement seul élimine ~30-40% des BOS parasites
-#  (cassures en range, micro-structures sur faible volume).
+#  Logique Wyckoff / ICT sur H4 + H1 :
+#
+#  ACCUMULATION  → Range latéral H4 avec stop hunts successifs
+#                   des lows (equal lows / spring) + volumes bas
+#
+#  MANIPULATION  → Spike brusque contra-trend suivi d'une clôture
+#                   inverse (stop hunt d'un côté = manipulation)
+#                   Détecté sur M15/H1 : wick extrême + retour fort
+#
+#  DISTRIBUTION  → Move impulsif H1 dans le sens du biais après
+#                   la manipulation + BOS de structure courte
+#
+#  Retourne un dict :
+#    phase      : 'ACCUMULATION' | 'MANIPULATION' | 'DISTRIBUTION' | 'UNKNOWN'
+#    confidence : int 0–100
+#    details    : str (description lisible)
+#    direction  : str 'BULLISH' | 'BEARISH' | ''
+# ─────────────────────────────────────────────────────────────
+def detect_amd_cycle(df_h1: pd.DataFrame,
+                     df_m15: pd.DataFrame) -> dict:
+    """
+    Détecte la phase AMD (Accumulation / Manipulation / Distribution)
+    sur H1 et M15.
+
+    Retourne :
+        phase      — 'ACCUMULATION' | 'MANIPULATION' | 'DISTRIBUTION' | 'UNKNOWN'
+        confidence — score 0–100
+        details    — description de la phase pour le message Telegram
+        direction  — biais probable de la Distribution ('BULLISH'|'BEARISH'|'')
+    """
+    result = {
+        "phase"     : "UNKNOWN",
+        "confidence": 0,
+        "details"   : "Phase AMD indéterminée",
+        "direction" : "",
+    }
+
+    if df_h1 is None or len(df_h1) < 30:
+        return result
+    if df_m15 is None or len(df_m15) < 30:
+        return result
+
+    atr_h1 = (df_h1["high"] - df_h1["low"]).rolling(14).mean().iloc[-1]
+    if atr_h1 == 0 or np.isnan(atr_h1):
+        return result
+
+    w_h1    = df_h1.iloc[-30:]
+    highs   = w_h1["high"].values
+    lows    = w_h1["low"].values
+    closes  = w_h1["close"].values
+    opens   = w_h1["open"].values
+
+    range_high = highs.max()
+    range_low  = lows.min()
+    range_size = range_high - range_low
+    if range_size <= 0:
+        return result
+
+    last_close = closes[-1]
+
+    # ── 1. Détection ACCUMULATION ─────────────────────────────
+    # Critères :
+    #   a) Range H1 comprimé (ATR < 30% du range des 30 dernières bougies)
+    #   b) Equal lows / spring : 2+ lows quasi-identiques (tolerance 0.5% ATR)
+    #   c) Clôtures restent dans le range (peu de breakouts)
+    acc_score = 0
+
+    # a) Range comprimé
+    body_sizes = np.abs(closes - opens)
+    avg_body   = body_sizes.mean()
+    if avg_body < atr_h1 * 0.55:
+        acc_score += 30
+
+    # b) Equal lows (spring potential)
+    tol_low = atr_h1 * 0.40
+    equal_lows = sum(1 for i in range(len(lows) - 1)
+                     for j in range(i + 1, len(lows))
+                     if abs(lows[i] - lows[j]) < tol_low
+                     and lows[i] < range_low + range_size * 0.25)
+    if equal_lows >= 2:
+        acc_score += 35
+
+    # c) Prix dans le range 80% du temps
+    in_range_count = sum(1 for c in closes
+                         if range_low + range_size * 0.10 <= c <= range_high - range_size * 0.10)
+    if in_range_count >= len(closes) * 0.75:
+        acc_score += 20
+
+    # d) Dernière bougie haussière après equal lows (spring + reversal)
+    if lows[-2] < range_low + range_size * 0.15 and closes[-1] > closes[-2]:
+        acc_score += 15
+
+    # ── 2. Détection MANIPULATION ─────────────────────────────
+    # Critères sur M15 :
+    #   a) Wick extrême > ATR × 1.8 dans un sens
+    #   b) Close à l'opposé du wick (rejet + return)
+    #   c) Stop hunt confirmé (sweep + return dans le range)
+    manip_score = 0
+    manip_direction = ""
+
+    atr_m15 = (df_m15["high"] - df_m15["low"]).rolling(14).mean().iloc[-1]
+    if atr_m15 > 0 and not np.isnan(atr_m15):
+        for i in range(-2, -6, -1):
+            if abs(i) + 1 > len(df_m15):
+                break
+            h  = df_m15["high"].iloc[i]
+            l  = df_m15["low"].iloc[i]
+            o  = df_m15["open"].iloc[i]
+            c  = df_m15["close"].iloc[i]
+            uw = h - max(o, c)   # upper wick
+            lw = min(o, c) - l   # lower wick
+
+            # Manipulation bearish → spike haussier rejeté (future short)
+            if uw > atr_m15 * 1.8 and c < o and lw < uw * 0.30:
+                manip_score += 50
+                manip_direction = "BEARISH"
+                break
+
+            # Manipulation bullish → spike baissier rejeté (future long)
+            if lw > atr_m15 * 1.8 and c > o and uw < lw * 0.30:
+                manip_score += 50
+                manip_direction = "BULLISH"
+                break
+
+        # Confirmation : bougie suivante dans le sens opposé à la manipulation
+        if manip_score > 0 and len(df_m15) >= 3:
+            c_last  = df_m15["close"].iloc[-2]
+            c_prev  = df_m15["close"].iloc[-3]
+            if manip_direction == "BEARISH" and c_last < c_prev:
+                manip_score += 30
+            elif manip_direction == "BULLISH" and c_last > c_prev:
+                manip_score += 30
+
+            # Volume relatif (si disponible) — bougie manipulation = volume fort
+            if "volume" in df_m15.columns:
+                avg_vol = df_m15["volume"].iloc[-20:].mean()
+                if df_m15["volume"].iloc[-3] > avg_vol * 1.5:
+                    manip_score += 20
+
+    manip_score = min(manip_score, 100)
+
+    # ── 3. Détection DISTRIBUTION ─────────────────────────────
+    # Critères sur H1 :
+    #   a) BOS récent (close > swing_high des 10 dernières en BULLISH)
+    #   b) Corps impulsif > ATR × 1.3 dans le sens du biais
+    #   c) Prix au-dessus du range moyen (pour LONG) ou dessous (SHORT)
+    dist_score   = 0
+    dist_direction = ""
+
+    # BOS H1 simple
+    swing_high_10 = highs[-11:-1].max()
+    swing_low_10  = lows[-11:-1].min()
+
+    if closes[-1] > swing_high_10:
+        dist_direction = "BULLISH"
+        dist_score += 40
+    elif closes[-1] < swing_low_10:
+        dist_direction = "BEARISH"
+        dist_score += 40
+
+    # Corps de la dernière bougie H1
+    last_body = abs(closes[-1] - opens[-1])
+    if last_body > atr_h1 * 1.3:
+        dist_score += 30
+
+    # Prix dans la moitié haute/basse
+    mid_range = (range_high + range_low) / 2
+    if dist_direction == "BULLISH" and closes[-1] > mid_range + range_size * 0.15:
+        dist_score += 20
+    elif dist_direction == "BEARISH" and closes[-1] < mid_range - range_size * 0.15:
+        dist_score += 20
+
+    # Bougies récentes toutes dans le même sens
+    last3_bull = all(closes[-i] > opens[-i] for i in range(1, 4) if i < len(closes))
+    last3_bear = all(closes[-i] < opens[-i] for i in range(1, 4) if i < len(closes))
+    if dist_direction == "BULLISH" and last3_bull:
+        dist_score += 10
+    elif dist_direction == "BEARISH" and last3_bear:
+        dist_score += 10
+
+    dist_score = min(dist_score, 100)
+
+    # ── Décision finale — phase dominante ─────────────────────
+    best = max(acc_score, manip_score, dist_score)
+
+    if best < 35:
+        return result  # Pas assez d'evidence
+
+    if best == dist_score and dist_score > 50:
+        direction = dist_direction
+        return {
+            "phase"     : "DISTRIBUTION",
+            "confidence": dist_score,
+            "details"   : (f"Phase D — Move impulsif {'haussier' if direction == 'BULLISH' else 'baissier'} "
+                           f"| BOS H1 {'au-dessus' if direction == 'BULLISH' else 'en-dessous'} du swing | "
+                           f"Corps > ATR×1.3"),
+            "direction" : direction,
+        }
+
+    if best == manip_score and manip_score > 45:
+        return {
+            "phase"     : "MANIPULATION",
+            "confidence": manip_score,
+            "details"   : (f"Phase M — Stop hunt {'baissier' if manip_direction == 'BEARISH' else 'haussier'} "
+                           f"| Wick extreme + rejet | Setup pre-Distribution probable"),
+            "direction" : "BULLISH" if manip_direction == "BEARISH" else "BEARISH",
+        }
+
+    if best == acc_score and acc_score > 45:
+        return {
+            "phase"     : "ACCUMULATION",
+            "confidence": acc_score,
+            "details"   : "Phase A — Range lateral | Equal lows | Compression avant move",
+            "direction" : "BULLISH",  # Post-accumulation → move haussier probable
+        }
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+#  DÉTECTION BOS — Break of Structure
 # ─────────────────────────────────────────────────────────────
 def detect_bos(df: pd.DataFrame) -> list[dict]:
     """
-    Détecte les cassures de structure (BOS) qualifiées.
-
-    Un BOS est retenu seulement si :
-      - close franchit le swing H/L des 10 dernières bougies (condition de base)
-      - la bougie de cassure montre un vrai displacement (corps ≥ 40% du range)
-
-    Flag optionnel "swept" : True si un stop hunt précède le BOS
-    (spike au-delà du swing suivi d'un retour, dans les 5 bougies avant).
+    Détecte les cassures de structure (BOS).
+    Un BOS bearish = close < swing low des N dernières bougies.
     """
     bos_list  = []
     lookback  = 10
-    atr_series = (df["high"] - df["low"]).rolling(14).mean()
 
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         close  = df["close"].iloc[i]
-        open_  = df["open"].iloc[i]
-        high_  = df["high"].iloc[i]
-        low_   = df["low"].iloc[i]
-
         swing_low  = window["low"].min()
         swing_high = window["high"].max()
 
-        # ── Filtre 1 : Displacement ───────────────────────────
-        # Corps de la bougie de cassure doit représenter ≥ 40% de son range.
-        # Élimine les doji, spinning tops, bougies en range.
-        candle_body  = abs(close - open_)
-        candle_range = high_ - low_
-        if candle_range == 0:
-            continue
-        displacement_ratio = candle_body / candle_range
-        if displacement_ratio < 0.40:
-            # Tolérance news : longues mèches sur fort momentum
-            # Si le range dépasse 1.5× ATR, le move est réel même avec
-            # un corps réduit (spike news propre, pas du bruit).
-            atr_val_news = atr_series.iloc[i]
-            is_news_candle = (
-                not np.isnan(atr_val_news)
-                and atr_val_news > 0
-                and candle_range >= atr_val_news * 1.5
-            )
-            if not is_news_candle:
-                continue   # Bougie trop indécise sans contexte news → skip
-
-        # ── Filtre 2 : Expansion ATR ──────────────────────────
-        # La bougie de cassure doit avoir un range ≥ 1.2× ATR14.
-        # Élimine les cassures sur faible momentum (range compressé).
-        # Note : ce filtre est court-circuité si la bougie news a déjà
-        # passé le seuil 1.5× (cohérence avec la tolérance ci-dessus).
-        atr_val_disp = atr_series.iloc[i]
-        if not np.isnan(atr_val_disp) and atr_val_disp > 0:
-            if candle_range < atr_val_disp * 1.2:
-                continue   # Pas assez de momentum → BOS non qualifié
-
-        bos_type = None
-        bos_level = None
-
         if close < swing_low:
-            bos_type  = "bearish"
-            bos_level = swing_low
+            bos_list.append({"index": i, "type": "bearish", "level": swing_low})
         elif close > swing_high:
-            bos_type  = "bullish"
-            bos_level = swing_high
-
-        if bos_type is None:
-            continue
-
-        # ── Filtre 2 : Sweep pré-BOS (optionnel — flag informatif) ──
-        # Dans les 5 bougies avant le BOS, le prix a-t-il spiké
-        # au-delà du swing puis clôturé de l'autre côté ?
-        # C'est le signe d'une prise de liquidité institutionnelle.
-        swept        = False
-        sweep_level  = None
-        pre_window   = df.iloc[max(0, i - 5):i]
-        atr_val      = atr_series.iloc[i]
-        if not np.isnan(atr_val) and atr_val > 0:
-            if bos_type == "bearish":
-                for j in range(len(pre_window)):
-                    pw_high  = pre_window["high"].iloc[j]
-                    pw_close = pre_window["close"].iloc[j]
-                    if pw_high > swing_high + atr_val * 0.20 and pw_close < swing_high:
-                        # ── Force du sweep : spike doit dépasser ≥ 0.5× ATR ──
-                        # Un micro-spike de quelques pips n'est pas un vrai
-                        # liquidity grab institutionnel.
-                        sweep_strength = abs(pw_high - swing_high)
-                        if sweep_strength >= atr_val * 0.5:
-                            swept       = True
-                            sweep_level = pw_high
-                        break
-            else:  # bullish BOS
-                for j in range(len(pre_window)):
-                    pw_low   = pre_window["low"].iloc[j]
-                    pw_close = pre_window["close"].iloc[j]
-                    if pw_low < swing_low - atr_val * 0.20 and pw_close > swing_low:
-                        sweep_strength = abs(swing_low - pw_low)
-                        if sweep_strength >= atr_val * 0.5:
-                            swept       = True
-                            sweep_level = pw_low
-                        break
-
-        bos_list.append({
-            "index"      : i,
-            "type"       : bos_type,
-            "level"      : bos_level,
-            "displacement": round(displacement_ratio, 2),   # pour debug/log
-            "swept"      : swept,          # True = prise de liquidité confirmée
-            "sweep_level": sweep_level,    # niveau du spike (anchor fibo alternatif)
-        })
+            bos_list.append({"index": i, "type": "bullish", "level": swing_high})
 
     return bos_list
 
@@ -1627,11 +2260,6 @@ def detect_trendline_liquidity(df: pd.DataFrame, direction: str) -> bool:
 OTE_LOW  = 0.62   # 62% du dealing range
 OTE_HIGH = 0.79   # 79% du dealing range (≈ fib 0.786)
 
-# Filtre FVG dans le move — True = obligatoire (ultra-sélectif)
-#                           False = informatif seulement (plus de trades)
-# Recommandé : True pour prop firm / live, False pour backtest exploratoire.
-USE_FVG_FILTER = True
-
 
 def detect_ote_zone(df: pd.DataFrame, direction: str,
                     bos_list: Optional[list] = None) -> Optional[dict]:
@@ -1709,31 +2337,6 @@ def detect_ote_zone(df: pd.DataFrame, direction: str,
         if move < atr * 2.0:
             return None   # Micro-structure ou range → fibo invalide
 
-        # ── Étape 4b : FVG dans le move — méthode directe (v9.2) ─
-        # Détection bougie-à-bougie : FVG bullish = low[j+1] > high[j-1]
-        # Plus fiable que detect_fvg() sur sous-fenêtre (évite les faux FVG).
-        # Un move institutionnel réel laisse toujours une inefficiency.
-        has_fvg_in_move = False
-        wi = window_impulse.reset_index(drop=True)
-        for j in range(1, len(wi) - 1):
-            if wi["low"].iloc[j + 1] > wi["high"].iloc[j - 1]:   # FVG bullish
-                has_fvg_in_move = True
-                break
-        if USE_FVG_FILTER and not has_fvg_in_move:
-            return None   # Move sans inefficiency → range déguisé → rejeté
-
-        # ── Étape 4c : Ancrage sur sweep si disponible (v9.2) ─
-        if recent_bos.get("swept") and recent_bos.get("sweep_level") is not None:
-            sweep_lo = recent_bos["sweep_level"]
-            swing_lo = min(swing_lo, sweep_lo)
-            move     = swing_hi - swing_lo
-
-        # ── Étape 4d : Cap move — protection spike news (v9.3) ─
-        # Un move > 10× ATR = spike news ou gap exotique.
-        # Le fibo serait trop étiré → niveaux OTE sans sens pratique.
-        if move > atr * 10:
-            return None   # Move extrême → dealing range non tradable
-
         # ── Étape 5 : OTE = retracement de swing_hi vers swing_lo ──
         # 62% retracement depuis le HIGH (haut du dealing range)
         ote_top    = round(swing_hi - move * OTE_LOW,  dec)   # 62%
@@ -1765,27 +2368,6 @@ def detect_ote_zone(df: pd.DataFrame, direction: str,
         if move < atr * 2.0:
             return None
 
-        # ── Étape 4b : FVG dans le move — méthode directe (v9.2) ─
-        # FVG bearish = high[j+1] < low[j-1]  (gap baissier entre j-1 et j+1)
-        has_fvg_in_move = False
-        wi = window_impulse.reset_index(drop=True)
-        for j in range(1, len(wi) - 1):
-            if wi["high"].iloc[j + 1] < wi["low"].iloc[j - 1]:   # FVG bearish
-                has_fvg_in_move = True
-                break
-        if USE_FVG_FILTER and not has_fvg_in_move:
-            return None   # Move sans inefficiency → rejeté
-
-        # ── Étape 4c : Ancrage sur sweep si disponible (v9.2) ─
-        if recent_bos.get("swept") and recent_bos.get("sweep_level") is not None:
-            sweep_hi = recent_bos["sweep_level"]
-            swing_hi = max(swing_hi, sweep_hi)
-            move     = swing_hi - swing_lo
-
-        # ── Étape 4d : Cap move — protection spike news (v9.3) ─
-        if move > atr * 10:
-            return None   # Move extrême → dealing range non tradable
-
         # OTE = retracement haussier de swing_lo vers swing_hi
         ote_bottom = round(swing_lo + move * OTE_LOW,  dec)   # 62%
         ote_top    = round(swing_lo + move * OTE_HIGH, dec)   # 79%
@@ -1811,9 +2393,6 @@ def detect_ote_zone(df: pd.DataFrame, direction: str,
         "move_size"     : round(move, dec),
         "bos_level"     : bos_lvl,
         "dealing_range" : f"{round(swing_lo, dec)} → {round(swing_hi, dec)}",
-        "has_fvg"       : has_fvg_in_move,   # v9.2 — FVG dans le move impulsif
-        "bos_swept"     : recent_bos.get("swept", False),   # v9.2 — sweep pré-BOS
-        "bos_displacement": recent_bos.get("displacement", 0.0),  # v9.2 — qualité BOS
     }
 
 
@@ -2367,6 +2946,8 @@ def compute_score(
     zone_fresh_ob: bool  = True,    # OB zone fraîche (non mitiquée)
     zone_fresh_fvg: bool = True,    # FVG zone fraîche (non mitiquée)
     market_trend: bool   = True,    # True = TREND, False = RANGE
+    # ── v10 CLEAN PA ────────────────────────────
+    clean_context: Optional[CleanPAContext] = None,
 ) -> tuple[int, list[str]]:
     """
     Score composite sur 100 — architecture tripolaire v8 avec setups avancés.
@@ -2475,6 +3056,9 @@ def compute_score(
     if older_block:
         score += 10
         reasons.append("🏛️ Older Block HTF actif — confluence HTF  (+10)")
+
+    # ── v10 : Clean PA scoring ───────────────────────────────
+    score, reasons = _clean_pa_scoring_block(score, reasons, clean_context)
 
     return min(max(score, 0), 100), reasons
 
@@ -2925,25 +3509,18 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
 
     if not silent:
         print(f"\n{c('═'*60, 'cyan')}")
-        print(f"  {c('SMC ENGINE v9', 'yellow')}  —  {c(symbol, 'white')}  "
+        print(f"  {c('SMC ENGINE v10', 'yellow')}  —  {c(symbol, 'white')}  "
               f"{c(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'cyan')}")
-        print(f"  {c(f'H1 biais → M15 zone → M5 trigger + OTE + Breaker Elite (v9)', 'cyan')}")
+        print(f"  {c('H1 biais → M15 zone → M5 trigger + OTE DWO + Breaker Elite + Clean PA (v10)', 'cyan')}")
         print(c("═" * 60, "cyan"))
 
-    # ── Téléchargement 3 TF : H1 / M15 / M5 ────────────────
-    # H1 period="60d" → nécessaire pour EMA200 (v9.2 htf_bias).
-    # Sans 200 bougies H1, l'EMA200 tombe sur le fallback EMA100.
-    #
-    # Gold (GC=F) — choix du TF d'analyse :
-    #   M15 : zone OB/FVG/OTE — adapté pour entrées intraday sur Gold
-    #   M5  : trigger obligatoire (pin bar, engulfing, FVG retest)
-    #   → Gold est suffisamment liquide et volatile pour M15 + M5.
-    #   → Éviter M1 sur Gold : spread + slippage trop élevés à ce TF.
+    # ── Téléchargement 3 TF : H1 / M15 / M5 + D1 tendance fond ──
     if not silent:
-        print(f"  {c('↓', 'cyan')} Data  {htf} / {ltf} / 5m (tripolaire v9.2)…")
-    df_htf = fetch(symbol, htf, period="60d")   # 60j → EMA200 fiable (v9.2)
-    df_ltf = fetch(symbol, ltf, period="5d")    # M15 : zone institutionnelle
-    df_m5  = fetch(symbol, "5m", period="2d")   # M5  : trigger obligatoire
+        print(f"  {c('↓', 'cyan')} Data  {htf} / {ltf} / 5m / 1d (tripolaire v8 + tendance fond)…")
+    df_htf = fetch(symbol, htf, period="10d")
+    df_ltf = fetch(symbol, ltf, period="5d")   # M15 : zone institutionnelle
+    df_m5  = fetch(symbol, "5m", period="2d")  # M5  : trigger obligatoire
+    df_d1  = fetch(symbol, "1d", period="90d") # D1  : tendance de fond (v11)
 
     df_mtf = df_ltf   # alias M15
 
@@ -2976,6 +3553,52 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     if direction is None:
         if not silent:
             print(c("  ✗ Biais NEUTRAL — signal ignoré.", "yellow"))
+        return None
+
+    # ══════════════════════════════════════════════════════════
+    #  v11 — TENDANCE DE FOND D1 + AMD CYCLE
+    # ══════════════════════════════════════════════════════════
+
+    # ── Tendance Daily ────────────────────────────────────────
+    d1_trend = daily_trend(df_d1)
+    d1_aligned = (d1_trend == "NEUTRAL" or
+                  (d1_trend == "BULLISH" and direction == "LONG") or
+                  (d1_trend == "BEARISH" and direction == "SHORT"))
+    d1_counter = not d1_aligned and d1_trend != "NEUTRAL"
+
+    if not silent:
+        d1_color = "green" if d1_aligned else ("red" if d1_counter else "yellow")
+        d1_label = (f"✓ D1 {d1_trend} — aligné avec {direction}"
+                    if d1_aligned and d1_trend != "NEUTRAL"
+                    else f"⚠ D1 {d1_trend} — CONTRE-TENDANCE {direction}"
+                    if d1_counter else f"D1 {d1_trend} — neutre")
+        print(f"  {'📅 Tendance D1':<26} {c(d1_label, d1_color)}")
+
+    # Blocage si contre-tendance D1 forte
+    if d1_counter:
+        if not silent:
+            print(c(f"  ⛔ Signal contre la tendance de fond D1 ({d1_trend}) — "
+                    f"direction {direction} rejetée.", "red"))
+        return None
+
+    # ── AMD Cycle ─────────────────────────────────────────────
+    amd = detect_amd_cycle(df_htf, df_ltf)
+    if not silent:
+        amd_color = {
+            "ACCUMULATION": "cyan",
+            "MANIPULATION": "magenta",
+            "DISTRIBUTION": "green",
+        }.get(amd["phase"], "white")
+        print(f"  {'🔄 AMD Cycle':<26} "
+              f"{c(amd['phase'] + ' (' + str(amd['confidence']) + '%)', amd_color)}"
+              + (f"  ← {amd['details']}" if amd['phase'] != 'UNKNOWN' else ""))
+
+    # ── Filtrage AMD : on n'entre PAS en pleine Accumulation ──
+    # L'Accumulation = range = entrée hasardeuse. On attend M ou D.
+    if amd["phase"] == "ACCUMULATION" and amd["confidence"] >= 70:
+        if not silent:
+            print(c("  ⛔ Phase Accumulation confirmée (range) — "
+                    "entrée rejetée, attendre Manipulation.", "yellow"))
         return None
 
     # ══════════════════════════════════════════════════════════
@@ -3135,6 +3758,37 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     upcoming_bos = detect_upcoming_bos(df_mtf, direction)
 
     # ── Score multi-TF + setups avancés v9 ───────────────────
+
+    # ── v10 : CLEAN PA — qualité price action ─────────────────
+    # Calculer zone_h / zone_l depuis l'OB ou FVG principal
+    if ob_mtf_match is not None:
+        _zone_h = max(ob_mtf_match.top, ob_mtf_match.bottom)
+        _zone_l = min(ob_mtf_match.top, ob_mtf_match.bottom)
+    elif fvg_active is not None:
+        _zone_h = max(fvg_active.top, fvg_active.bottom)
+        _zone_l = min(fvg_active.top, fvg_active.bottom)
+    else:
+        _zone_h = _zone_l = 0.0
+
+    clean_ctx = detect_clean_pa_adaptive(
+        df        = df_mtf,
+        direction = direction,
+        symbol    = symbol,
+        zone_high = _zone_h,
+        zone_low  = _zone_l,
+    )
+
+    # Bloquer le signal si PA insuffisant
+    if not clean_ctx.is_valid:
+        if not silent:
+            pa_block_reason = (
+                "choppy" if clean_ctx.is_choppy
+                else "no displacement" if not clean_ctx.displacement_ok
+                else f"clean_score={clean_ctx.clean_score}"
+            )
+            print(c(f"  [CLEAN PA] Setup bloqué — {pa_block_reason}", "red"))
+        return None
+
     score, reasons = compute_score(
         bias, direction,
         has_bos  = has_bos_ltf,
@@ -3162,7 +3816,24 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         zone_fresh_ob    = zone_fresh_ob,
         zone_fresh_fvg   = zone_fresh_fvg,
         market_trend     = market_is_trend,
+        # v10 CLEAN PA
+        clean_context    = clean_ctx,
     )
+
+    # ── v11 : Bonus/Pénalité Tendance D1 ─────────────────────
+    if d1_aligned and d1_trend != "NEUTRAL":
+        score = min(score + 12, 100)
+        reasons.append(f"📅 Tendance D1 {d1_trend} alignée — trade dans le sens du fond  (+12)")
+
+    # ── v11 : Bonus AMD phase ─────────────────────────────────
+    if amd["phase"] == "MANIPULATION" and amd["confidence"] >= 60:
+        score = min(score + 15, 100)
+        reasons.append(f"🔄 AMD — Phase Manipulation détectée ({amd['confidence']}%)  (+15)")
+    elif amd["phase"] == "DISTRIBUTION" and amd["confidence"] >= 55:
+        # Distribution dans le sens du trade = confirmation forte
+        if amd["direction"] == direction:
+            score = min(score + 10, 100)
+            reasons.append(f"🔄 AMD — Phase Distribution {amd['direction']} confirmée ({amd['confidence']}%)  (+10)")
 
     # ── Remplace le label générique par le nom du pattern réel ──
     for idx, r in enumerate(reasons):
@@ -3176,17 +3847,6 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
     if m5_trigger_ok:
         score = min(score + 7, 100)
         reasons.append(f"⚡ Trigger M5 : {m5_pattern}  — entrée sniper  (+7)")
-
-    # ── Bonus OTE — qualité du dealing range (v9.2) ──────────
-    if ote_result is not None:
-        # FVG dans le move impulsif = displacement institutionnel confirmé
-        if ote_result.get("has_fvg"):
-            score = min(score + 10, 100)
-            reasons.append("📐 FVG dans le move OTE — displacement institutionnel  (+10)")
-        # BOS précédé d'un sweep = origin ICT-pure
-        if ote_result.get("bos_swept"):
-            score = min(score + 8, 100)
-            reasons.append("💧 Sweep pré-BOS — origine Dealing Range sur liquidité  (+8)")
 
     # ── Affichage détails ────────────────────────────────────
     def tick(v): return c("✓", "green") if v else c("✗", "red")
@@ -3224,6 +3884,27 @@ def analyse(symbol: str, htf: str = HTF, ltf: str = LTF,
         print(f"  {'FVG 30min (≈45min)':<26} {tick(fvg_30m)}")
         print(f"  {'Trendline Liq. sweepée':<26} {tick(trendline_liq)}")
         print(f"  {'Older Block HTF':<26} {tick(older_block)}")
+        # ── v10 : Clean PA ───────────────────────────────────────
+        print(f"  {c('── Clean PA ──', 'cyan')}")
+        pa_color = ("green" if clean_ctx.clean_score >= 6
+                    else "yellow" if clean_ctx.clean_score >= CLEAN_MIN_SCORE
+                    else "red")
+        print(f"  {'Structure':<26} {tick(clean_ctx.structure_ok)}"
+              + (f"  {clean_ctx.swing_count} swings {clean_ctx.structure_type}"
+                 if clean_ctx.structure_ok else ""))
+        print(f"  {'Displacement':<26} {tick(clean_ctx.displacement_ok)}"
+              + (f"  {clean_ctx.impulse_strength}×ATR"
+                 + (f" × {clean_ctx.impulse_consec}b" if clean_ctx.impulse_consec > 1 else "")
+                 if clean_ctx.displacement_ok else "  ❌ AUCUNE IMPULSION"))
+        print(f"  {'Liquidité sweepée':<26} {tick(clean_ctx.liquidity_swept)}"
+              + (f"  {clean_ctx.sweep_type} @ {clean_ctx.sweep_level}"
+                 if clean_ctx.liquidity_swept else ""))
+        print(f"  {'Pullback propre':<26} {tick(clean_ctx.pullback_ok)}"
+              + (f"  qualité {clean_ctx.pullback_quality}" if clean_ctx.pullback_ok else ""))
+        chop_c = "red" if clean_ctx.is_choppy else "green"
+        print(f"  {'Marché choppy':<26} {c('OUI — BLOQUANT' if clean_ctx.is_choppy else 'NON', chop_c)}"
+              + (f"  {clean_ctx.chop_reason}" if clean_ctx.is_choppy else ""))
+        print(f"  {'Clean PA Score':<26} {c(str(clean_ctx.clean_score) + '/9 — ' + clean_ctx.label, pa_color)}")
         if upcoming_bos:
             dec_u = 2 if price_now > 100 else 5
             print(f"  {'Upcoming BOS (target)':<26} {c(str(round(upcoming_bos, dec_u)), 'magenta')}") 
@@ -3517,11 +4198,33 @@ MARKETS: dict[str, list[tuple[str, str]]] = {
 #  TIER 3  🥉  Forex croisées + reste
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+#  WATCHLIST — PRIORITÉS PAR TIER  (v10)
+#
+#  TIER 1  🥇  Gold · BTC · Silver · Oil · ETH + Indices majeurs
+#              Scannés EN PREMIER à CHAQUE cycle + cycle dédié intercalé
+#  TIER 2  🥈  Forex majeures (7 paires)
+#  TIER 3  🥉  Forex croisées + exotiques + autres commodités
+# ─────────────────────────────────────────────────────────────
+
 TIER_1_PRIORITY: list[tuple[str, str]] = [
-    # ── 🥇 GOLD — priorité absolue ───────────────────────────
+    # ── 🥇 GOLD — priorité absolue, haute volatilité ──────────
     ("GC=F",     "Gold"),
     # ── 🥇 BTC — crypto unique, scan 24/7 week-end inclus ────
     ("BTC-USD",  "Bitcoin"),
+    # ── 🥇 ETH — deuxième crypto principale ──────────────────
+    ("ETH-USD",  "Ethereum"),
+    # ── 🥇 SILVER — suit Gold, volatilité élevée ─────────────
+    ("SI=F",     "Silver"),
+    # ── 🥇 OIL WTI — très liquide, bons setups SMC ───────────
+    ("CL=F",     "Oil WTI"),
+    # ── 🥇 OIL BRENT ──────────────────────────────────────────
+    ("BZ=F",     "Oil Brent"),
+    # ── 🥇 INDICES MAJEURS ────────────────────────────────────
+    ("^GSPC",    "S&P 500"),
+    ("^NDX",     "Nasdaq 100"),
+    ("^DJI",     "Dow Jones"),
+    ("^GDAXI",   "DAX"),
 ]
 
 TIER_2_FOREX: list[tuple[str, str]] = [
@@ -3570,24 +4273,33 @@ TIER_3_EXTRA: list[tuple[str, str]] = [
     ("HG=F",     "Cuivre"),
     ("PL=F",     "Platine"),
     ("PA=F",     "Palladium"),
-    # ── 🥉 INDICES ────────────────────────────────────────────
-    ("^GSPC",    "S&P 500"),
-    ("^NDX",     "Nasdaq 100"),
-    ("^DJI",     "Dow Jones"),
-    ("^GDAXI",   "DAX"),
+    # ── 🥉 AUTRES INDICES ─────────────────────────────────────
     ("^FCHI",    "CAC 40"),
     ("^FTSE",    "FTSE 100"),
     ("^N225",    "Nikkei 225"),
+    ("^HSI",     "Hang Seng"),
+    # ── 🥉 AUTRES CRYPTO ─────────────────────────────────────
+    ("XRP-USD",  "Ripple"),
+    ("SOL-USD",  "Solana"),
+    ("BNB-USD",  "BNB"),
+    ("ADA-USD",  "Cardano"),
+    ("AVAX-USD", "Avalanche"),
+    ("LINK-USD", "Chainlink"),
+    ("DOGE-USD", "Dogecoin"),
+    ("LTC-USD",  "Litecoin"),
 ]
 
 # Correspondance catégorie → liste de symboles
 CATEGORY_MAP: dict[str, list[tuple[str, str]]] = {
-    "priority"   : TIER_1_PRIORITY,
-    "forex"      : TIER_2_FOREX,                                              # 7 majeures
-    "forex_all"  : TIER_2_FOREX + [s for s in TIER_3_EXTRA if "=X" in s[0]],
-    "all"        : TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA,
+    "priority"    : TIER_1_PRIORITY,                                          # Gold/BTC/ETH/Indices
+    "forex"       : TIER_2_FOREX,                                             # 7 majeures seulement
+    "forex_all"   : TIER_2_FOREX + [s for s in TIER_3_EXTRA if "=X" in s[0]],
+    "crypto"      : [s for s in TIER_1_PRIORITY + TIER_3_EXTRA if "-USD" in s[0]],
+    "commodities" : [s for s in TIER_1_PRIORITY + TIER_3_EXTRA
+                     if s[0] in ("GC=F","SI=F","CL=F","BZ=F","NG=F","HG=F","PL=F","PA=F")],
+    "indices"     : [s for s in TIER_1_PRIORITY + TIER_3_EXTRA if s[0].startswith("^")],
+    "all"         : TIER_1_PRIORITY + TIER_2_FOREX + TIER_3_EXTRA,
 }
-# garde compat anciens alias
 CATEGORY_ALIASES = CATEGORY_MAP
 
 
@@ -3974,6 +4686,15 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
     symbols = get_symbols(cat)
 
+    # ── v11 : BTC + Gold toujours en tête de liste ────────────
+    # Quel que soit le mode (forex, all, priority…), BTC-USD et GC=F
+    # sont déplacés en première position pour être scannés en priorité absolue.
+    _PRIORITY_FIRST = ["BTC-USD", "GC=F"]
+    _sym_dict = {s: m for s, m in symbols}
+    priority_items = [(s, _sym_dict[s]) for s in _PRIORITY_FIRST if s in _sym_dict]
+    rest_items     = [(s, m) for s, m in symbols if s not in _PRIORITY_FIRST]
+    symbols = priority_items + rest_items
+
     # ── ① Liste des marchés ────────────────────────────────────
     print_market_list(symbols)
     log.info(f"  Watchlist : {len(symbols)} paire(s) — cat={cat}")
@@ -3996,15 +4717,14 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
             now_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
             now_hhmm = now_utc.strftime("%H:%M UTC")
 
-            # ── Hors session → pause sauf BTC (24/7) ──────────
-            # BTC est scanné en continu même le week-end.
-            # Les autres marchés (Forex, Indices) sont bloqués hors London/NY
-            # et le week-end.
+            # ── Hors session → BTC-USD uniquement (week-end / nuit) ──
+            # Les marchés Forex/Indices/Commodités sont bloqués hors London/NY.
+            # Le week-end, seul BTC-USD est scanné (crypto 24/7 restreinte à BTC).
+            CRYPTO_SYMBOLS = frozenset({"BTC-USD"})
             btc_only_mode = not is_session_active()
             if btc_only_mode:
-                # Filtre uniquement BTC pour continuer hors session
-                btc_symbols = [(s, m) for s, m in symbols if s == "BTC-USD"]
-                if not btc_symbols:
+                crypto_syms = [(s, m) for s, m in symbols if s in CRYPTO_SYMBOLS]
+                if not crypto_syms:
                     if cycle_n % 10 == 1:
                         log.info(f"  💤 [{cycle_n}] {now_hhmm} — Hors session — Script actif ✓")
                     with _STATUS_LOCK:
@@ -4013,10 +4733,9 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
                         _STATUS["scan_running"] = False
                     time.sleep(interval)
                     continue
-                # BTC seulement hors session / week-end
-                symbols_this_cycle = btc_symbols
+                symbols_this_cycle = crypto_syms
                 if cycle_n % 5 == 1:
-                    log.info(f"  🟡 [{cycle_n}] {now_hhmm} — Hors session — BTC scan continu (week-end/nuit)")
+                    log.info(f"  🟡 [{cycle_n}] {now_hhmm} — Hors session — Crypto scan continu ({len(crypto_syms)} marchés)")
             else:
                 symbols_this_cycle = symbols
 
@@ -4054,7 +4773,20 @@ def run_live(cat: str = "forex", min_score: int = SCORE_THRESHOLD,
 
             signals_found: list[tuple[str, str, "Signal", str]] = []   # (mkt, sym, sig, tier_label)
 
-            # ── Scan marché par marché ─────────────────────────
+            # ── Scan marché par marché ────────────────────────
+            # ORDRE DE PRIORITÉ : TIER 1 (Gold/BTC/Indices) apparaît
+            # toujours EN TÊTE de la liste symbols_this_cycle.
+            # Les TIER 1 ont déjà été placés premiers dans TIER_1_PRIORITY
+            # → scan_watchlist les traite dans l'ordre naturel.
+            #
+            # Mode "priority burst" : si cycle_n % 3 == 1 → rescan
+            # immédiat Tier 1 seul en début de cycle, AVANT les autres.
+            if not btc_only_mode and cycle_n % 3 == 1:
+                t1_syms = [(s, m) for s, m in symbols_this_cycle
+                           if any(s == x[0] for x in TIER_1_PRIORITY)]
+                if t1_syms and len(t1_syms) > 0:
+                    log.info(f"  ★ Burst TIER 1 ({len(t1_syms)} marchés) — cycle {cycle_n}")
+
             for i, (sym, mkt) in enumerate(symbols_this_cycle, 1):
                 tier = _tier_of(sym)
                 prefix = f"  {i:<4} {tier}  {mkt:<14} {c(sym, 'cyan'):<12}"
